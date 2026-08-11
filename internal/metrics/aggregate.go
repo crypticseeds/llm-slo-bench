@@ -23,6 +23,7 @@ const (
 	tokensPerSecondScale    = 1000
 	histogramDurationUnit   = "ms"
 	histogramThroughputUnit = "tokens_per_second"
+	distributionPointCap    = 100
 )
 
 type Outcome string
@@ -55,18 +56,24 @@ type Counts struct {
 }
 
 type HistogramSummary struct {
-	Count              int64   `json:"count"`
-	Min                float64 `json:"min"`
-	Max                float64 `json:"max"`
-	Mean               float64 `json:"mean"`
-	P50                float64 `json:"p50"`
-	P90                float64 `json:"p90"`
-	P95                float64 `json:"p95"`
-	P99                float64 `json:"p99"`
-	LowestTrackable    float64 `json:"lowest_trackable"`
-	HighestTrackable   float64 `json:"highest_trackable"`
-	SignificantFigures int     `json:"significant_figures"`
-	Unit               string  `json:"unit"`
+	Count              int64               `json:"count"`
+	Min                float64             `json:"min"`
+	Max                float64             `json:"max"`
+	Mean               float64             `json:"mean"`
+	P50                float64             `json:"p50"`
+	P90                float64             `json:"p90"`
+	P95                float64             `json:"p95"`
+	P99                float64             `json:"p99"`
+	LowestTrackable    float64             `json:"lowest_trackable"`
+	HighestTrackable   float64             `json:"highest_trackable"`
+	SignificantFigures int                 `json:"significant_figures"`
+	Unit               string              `json:"unit"`
+	Distribution       []DistributionPoint `json:"distribution"`
+}
+
+type DistributionPoint struct {
+	Percentile float64 `json:"percentile"`
+	Value      float64 `json:"value"`
 }
 
 type MetricSummaries struct {
@@ -397,7 +404,37 @@ func summarize(histogram *hdrhistogram.Histogram, scale float64, unit string) *H
 		HighestTrackable:   float64(HighestTrackableMicros) / scale,
 		SignificantFigures: SignificantFigures,
 		Unit:               unit,
+		Distribution:       distributionFor(histogram, scale),
 	}
+}
+
+func distributionFor(histogram *hdrhistogram.Histogram, scale float64) []DistributionPoint {
+	brackets := histogram.CumulativeDistribution()
+	if len(brackets) == 0 {
+		return nil
+	}
+	if len(brackets) == 1 {
+		value := float64(brackets[0].ValueAt) / scale
+		return []DistributionPoint{{Percentile: 0, Value: value}, {Percentile: 100, Value: value}}
+	}
+	step := 1
+	if len(brackets) > distributionPointCap {
+		step = (len(brackets) - 1 + distributionPointCap - 2) / (distributionPointCap - 1)
+	}
+	points := make([]DistributionPoint, 0, min(len(brackets), distributionPointCap))
+	for index := 0; index < len(brackets); index += step {
+		bracket := brackets[index]
+		points = append(points, DistributionPoint{Percentile: bracket.Quantile, Value: float64(bracket.ValueAt) / scale})
+	}
+	last := brackets[len(brackets)-1]
+	if points[len(points)-1].Percentile != last.Quantile || points[len(points)-1].Value != float64(last.ValueAt)/scale {
+		if len(points) == distributionPointCap {
+			points[len(points)-1] = DistributionPoint{Percentile: last.Quantile, Value: float64(last.ValueAt) / scale}
+		} else {
+			points = append(points, DistributionPoint{Percentile: last.Quantile, Value: float64(last.ValueAt) / scale})
+		}
+	}
+	return points
 }
 
 func tokenCost(usage *probe.Usage, pricing Pricing) float64 {
@@ -424,6 +461,7 @@ func cloneHistogramSummary(summary *HistogramSummary) *HistogramSummary {
 		return nil
 	}
 	clone := *summary
+	clone.Distribution = append([]DistributionPoint(nil), summary.Distribution...)
 	return &clone
 }
 
