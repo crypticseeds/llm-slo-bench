@@ -15,6 +15,17 @@ import (
 	"time"
 )
 
+var (
+	ErrSendRequest       = errors.New("send request")
+	ErrHTTPStatus        = errors.New("HTTP status")
+	ErrContentType       = errors.New("Content-Type")
+	ErrStreamIdleTimeout = errors.New("stream idle timeout")
+	ErrStreamEnded       = errors.New("stream ended")
+	ErrReadStream        = errors.New("read SSE stream")
+	ErrDecodeEvent       = errors.New("decode OpenAI stream event")
+	ErrNoContent         = errors.New("stream completed without content")
+)
+
 type Config struct {
 	Endpoint            string
 	Model               string
@@ -34,6 +45,7 @@ type Usage struct {
 
 type Result struct {
 	StatusCode    int
+	Dispatch      time.Time
 	TTFB          time.Duration
 	TTFT          time.Duration
 	ChunkITL      []time.Duration
@@ -94,13 +106,15 @@ func Run(parent context.Context, cfg Config) (Result, error) {
 	// keeps DNS, connect, TLS, and server wait inside both diagnostic TTFB and
 	// semantic TTFT without exposure to wall-clock adjustments.
 	start := time.Now()
+	result := Result{Dispatch: start}
 	response, err := client.Do(request)
 	if err != nil {
-		return Result{}, fmt.Errorf("send request: %w", err)
+		result.Duration = time.Since(start)
+		return result, wrapError(ErrSendRequest, fmt.Errorf("send request: %w", err))
 	}
 	defer response.Body.Close()
 
-	result := Result{StatusCode: response.StatusCode}
+	result.StatusCode = response.StatusCode
 	select {
 	case at := <-firstByte:
 		result.TTFB = at.Sub(start)
@@ -108,12 +122,14 @@ func Run(parent context.Context, cfg Config) (Result, error) {
 	}
 	if response.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-		return result, fmt.Errorf("endpoint returned %s: %s", response.Status, strings.TrimSpace(string(body)))
+		result.Duration = time.Since(start)
+		return result, wrapError(ErrHTTPStatus, fmt.Errorf("endpoint returned %s: %s", response.Status, strings.TrimSpace(string(body))))
 	}
 	contentType := response.Header.Get("Content-Type")
 	mediaType, _, err := mime.ParseMediaType(contentType)
 	if err != nil || !strings.EqualFold(mediaType, "text/event-stream") {
-		return result, fmt.Errorf("endpoint returned Content-Type %q, want text/event-stream", contentType)
+		result.Duration = time.Since(start)
+		return result, wrapError(ErrContentType, fmt.Errorf("endpoint returned Content-Type %q, want text/event-stream", contentType))
 	}
 
 	idleExpired := make(chan struct{}, 1)
@@ -131,22 +147,23 @@ func Run(parent context.Context, cfg Config) (Result, error) {
 	for {
 		event, err := decoder.Next()
 		if err != nil {
+			result.Duration = time.Since(start)
 			select {
 			case <-idleExpired:
-				return result, fmt.Errorf("stream idle timeout after %s", cfg.StreamIdleTimeout)
+				return result, wrapError(ErrStreamIdleTimeout, fmt.Errorf("stream idle timeout after %s", cfg.StreamIdleTimeout))
 			default:
 			}
 			if errors.Is(err, io.EOF) {
-				return result, errors.New("stream ended before [DONE]")
+				return result, wrapError(ErrStreamEnded, errors.New("stream ended before [DONE]"))
 			}
-			return result, fmt.Errorf("read SSE stream: %w", err)
+			return result, wrapError(ErrReadStream, fmt.Errorf("read SSE stream: %w", err))
 		}
 		idleTimer.Reset(cfg.StreamIdleTimeout)
 		now := time.Now()
 		if event.Data == "[DONE]" {
 			result.Duration = now.Sub(start)
 			if result.ContentEvents == 0 {
-				return result, errors.New("stream completed without a non-empty content event")
+				return result, wrapError(ErrNoContent, errors.New("stream completed without a non-empty content event"))
 			}
 			return result, nil
 		}
@@ -160,7 +177,8 @@ func Run(parent context.Context, cfg Config) (Result, error) {
 			Usage *Usage `json:"usage"`
 		}
 		if err := json.Unmarshal([]byte(event.Data), &chunk); err != nil {
-			return result, fmt.Errorf("decode OpenAI stream event: %w", err)
+			result.Duration = time.Since(start)
+			return result, wrapError(ErrDecodeEvent, fmt.Errorf("decode OpenAI stream event: %w", err))
 		}
 		if chunk.Usage != nil {
 			result.Usage = chunk.Usage
@@ -180,6 +198,24 @@ func Run(parent context.Context, cfg Config) (Result, error) {
 			previousContent = now
 		}
 	}
+}
+
+type categorizedError struct {
+	message  string
+	sentinel error
+	cause    error
+}
+
+func (e *categorizedError) Error() string {
+	return e.message
+}
+
+func (e *categorizedError) Unwrap() []error {
+	return []error{e.sentinel, e.cause}
+}
+
+func wrapError(sentinel, cause error) error {
+	return &categorizedError{message: cause.Error(), sentinel: sentinel, cause: cause}
 }
 
 func validateConfig(cfg Config) error {

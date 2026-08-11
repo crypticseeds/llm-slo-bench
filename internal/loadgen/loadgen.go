@@ -8,14 +8,19 @@ import (
 	"net"
 	"net/http"
 	"sort"
-	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/crypticseeds/llm-slo-bench/internal/config"
 	"github.com/crypticseeds/llm-slo-bench/internal/probe"
 )
 
-const DefaultMaxScheduleLag = 100 * time.Millisecond
+const (
+	DefaultMaxScheduleLag = 100 * time.Millisecond
+	maxErrorMessageBytes  = 160
+)
+
+var errDispatchLate = errors.New("request dispatch exceeded schedule lag")
 
 type DropReason string
 
@@ -27,10 +32,11 @@ const (
 type StopReason string
 
 const (
-	StopNone          StopReason = ""
-	StopRequestLimit  StopReason = "request_limit"
-	StopDurationLimit StopReason = "duration_limit"
-	StopCostLimit     StopReason = "cost_limit"
+	StopNone                  StopReason = ""
+	StopRequestLimit          StopReason = "request_limit"
+	StopDurationLimit         StopReason = "duration_limit"
+	StopCostLimit             StopReason = "cost_limit"
+	StopCostReservationBreach StopReason = "cost_reservation_breach"
 )
 
 type ErrorClass string
@@ -103,7 +109,7 @@ func (realClock) Now() time.Time {
 func (realClock) WaitUntil(ctx context.Context, deadline time.Time) error {
 	delay := time.Until(deadline)
 	if delay <= 0 {
-		return nil
+		return ctx.Err()
 	}
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
@@ -247,6 +253,14 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 
 	collect := func(item completion) {
 		inFlight--
+		<-semaphore
+		if item.outcome.Dropped {
+			result.Counts.Started--
+			result.Counts.Dropped++
+			heldCost -= cfg.Safety.ReserveCostPerRequestUSD
+			result.Outcomes = append(result.Outcomes, item.outcome)
+			return
+		}
 		result.Counts.Completed++
 		if item.outcome.Cancelled {
 			result.Counts.Cancelled++
@@ -258,6 +272,9 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 		if item.hasCost {
 			result.KnownCostUSD += item.costUSD
 			heldCost += item.costUSD - cfg.Safety.ReserveCostPerRequestUSD
+			if item.costUSD > cfg.Safety.ReserveCostPerRequestUSD {
+				result.StopReason = StopCostReservationBreach
+			}
 		}
 		result.Outcomes = append(result.Outcomes, item.outcome)
 	}
@@ -272,6 +289,7 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 		}
 	}
 
+scheduleLoop:
 	for sequence := 1; ; sequence++ {
 		offset, ok, err := schedule.next()
 		if err != nil {
@@ -293,11 +311,17 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 			break
 		}
 		drain()
+		if result.StopReason == StopCostReservationBreach {
+			break
+		}
+		if ctx.Err() != nil {
+			break
+		}
 		if clk.Now().After(start.Add(cfg.Safety.MaxDuration.Duration)) {
 			result.StopReason = StopDurationLimit
 			break
 		}
-		if heldCost+cfg.Safety.ReserveCostPerRequestUSD > cfg.Safety.MaxCostUSD+1e-12 {
+		if heldCost+cfg.Safety.ReserveCostPerRequestUSD > cfg.Safety.MaxCostUSD {
 			result.StopReason = StopCostLimit
 			break
 		}
@@ -310,28 +334,61 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 			result.Outcomes = append(result.Outcomes, droppedOutcome(sequence, intended, now, lag, DropLate))
 			continue
 		}
+		if ctx.Err() != nil {
+			break
+		}
 		select {
 		case semaphore <- struct{}{}:
 		default:
-			result.Counts.Dropped++
-			result.Outcomes = append(result.Outcomes, droppedOutcome(sequence, intended, now, lag, DropSaturated))
-			continue
+			drain()
+			if result.StopReason == StopCostReservationBreach {
+				break scheduleLoop
+			}
+			if ctx.Err() != nil {
+				break scheduleLoop
+			}
+			select {
+			case semaphore <- struct{}{}:
+			default:
+				result.Counts.Dropped++
+				result.Outcomes = append(result.Outcomes, droppedOutcome(sequence, intended, now, lag, DropSaturated))
+				continue
+			}
+		}
+		drain()
+		if result.StopReason == StopCostReservationBreach {
+			<-semaphore
+			break
+		}
+		if ctx.Err() != nil {
+			<-semaphore
+			break
 		}
 
 		heldCost += cfg.Safety.ReserveCostPerRequestUSD
-
-		dispatched := make(chan time.Time, 1)
+		workerReady := make(chan time.Time, 1)
 		proceed := make(chan bool, 1)
 		rejected := make(chan struct{})
 		go func(sequence int, intended time.Time) {
+			var probeResult probe.Result
+			var runErr error
 			dispatch := clk.Now()
-			dispatched <- dispatch
+			workerReady <- dispatch
 			if !<-proceed {
 				<-semaphore
 				close(rejected)
 				return
 			}
-			probeResult, runErr := runner(ctx, cfg.Probe)
+			if err := ctx.Err(); err != nil {
+				runErr = err
+			} else {
+				probeCfg := cfg.Probe
+				probeCfg.HTTPClient = clientWithDispatchDeadline(probeCfg.HTTPClient, intended.Add(cfg.MaxScheduleLag))
+				probeResult, runErr = runner(ctx, probeCfg)
+			}
+			if !probeResult.Dispatch.IsZero() {
+				dispatch = probeResult.Dispatch
+			}
 			outcome := Outcome{
 				Sequence:        sequence,
 				IntendedArrival: intended,
@@ -339,10 +396,16 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 				ScheduleLag:     dispatch.Sub(intended),
 				Result:          probeResult,
 			}
-			if runErr != nil {
-				outcome.Error = runErr.Error()
+			if (!probeResult.Dispatch.IsZero() && outcome.ScheduleLag > cfg.MaxScheduleLag) || errors.Is(runErr, errDispatchLate) {
+				outcome.Dropped = true
+				outcome.DropReason = DropLate
+			}
+			if errors.Is(runErr, errDispatchLate) {
+				outcome.ErrorClass = ErrorNone
+			} else if runErr != nil {
 				outcome.Cancelled = errors.Is(runErr, context.Canceled) || (errors.Is(runErr, context.DeadlineExceeded) && ctx.Err() != nil)
 				outcome.ErrorClass = classifyError(runErr, outcome.Cancelled, probeResult.StatusCode)
+				outcome.Error = sanitizedErrorMessage(outcome.ErrorClass, probeResult.StatusCode)
 			} else if probeResult.Usage != nil && !validUsage(probeResult.Usage) {
 				outcome.Error = "invalid usage token counts"
 				outcome.ErrorClass = ErrorUsage
@@ -352,18 +415,19 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 				item.hasCost = true
 				item.costUSD = requestCost(probeResult.Usage, cfg.Pricing)
 			}
-			<-semaphore
 			completions <- item
 		}(sequence, intended)
-
-		dispatch := <-dispatched
-		dispatchLag := dispatch.Sub(intended)
-		if dispatchLag > cfg.MaxScheduleLag {
+		workerDispatch := <-workerReady
+		workerLag := workerDispatch.Sub(intended)
+		if workerLag > cfg.MaxScheduleLag || ctx.Err() != nil {
 			proceed <- false
 			<-rejected
 			heldCost -= cfg.Safety.ReserveCostPerRequestUSD
+			if ctx.Err() != nil {
+				break
+			}
 			result.Counts.Dropped++
-			result.Outcomes = append(result.Outcomes, droppedOutcome(sequence, intended, dispatch, dispatchLag, DropLate))
+			result.Outcomes = append(result.Outcomes, droppedOutcome(sequence, intended, workerDispatch, workerLag, DropLate))
 			continue
 		}
 		result.Counts.Started++
@@ -416,13 +480,37 @@ func classifyError(err error, cancelled bool, statusCode int) ErrorClass {
 	if errors.As(err, &networkError) && networkError.Timeout() {
 		return ErrorTimeout
 	}
-	if strings.Contains(err.Error(), "stream idle timeout") {
+	if errors.Is(err, probe.ErrStreamIdleTimeout) {
 		return ErrorTimeout
 	}
-	if statusCode != 0 && statusCode != http.StatusOK {
+	if errors.Is(err, probe.ErrHTTPStatus) || statusCode != 0 && statusCode != http.StatusOK {
 		return ErrorHTTP
 	}
 	return ErrorStream
+}
+
+func sanitizedErrorMessage(class ErrorClass, statusCode int) string {
+	var message string
+	switch class {
+	case ErrorCancelled:
+		message = "request cancelled"
+	case ErrorTimeout:
+		message = "request timed out"
+	case ErrorHTTP:
+		if statusCode != 0 {
+			message = fmt.Sprintf("endpoint returned HTTP status %d", statusCode)
+		} else {
+			message = "endpoint returned an HTTP error"
+		}
+	case ErrorUsage:
+		message = "invalid usage token counts"
+	default:
+		message = "stream request failed"
+	}
+	if len(message) > maxErrorMessageBytes {
+		return message[:maxErrorMessageBytes]
+	}
+	return message
 }
 
 func newHTTPClient(maxInFlight int, responseHeaderTimeout time.Duration) *http.Client {
@@ -433,6 +521,34 @@ func newHTTPClient(maxInFlight int, responseHeaderTimeout time.Duration) *http.C
 		MaxConnsPerHost:       maxInFlight,
 		ResponseHeaderTimeout: responseHeaderTimeout,
 	}}
+}
+
+type dispatchDeadlineTransport struct {
+	base     http.RoundTripper
+	deadline time.Time
+	checked  *atomic.Bool
+}
+
+func (t dispatchDeadlineTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if t.checked.CompareAndSwap(false, true) {
+		if err := request.Context().Err(); err != nil {
+			return nil, err
+		}
+		if time.Now().After(t.deadline) {
+			return nil, errDispatchLate
+		}
+	}
+	return t.base.RoundTrip(request)
+}
+
+func clientWithDispatchDeadline(client *http.Client, deadline time.Time) *http.Client {
+	clone := *client
+	base := clone.Transport
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	clone.Transport = dispatchDeadlineTransport{base: base, deadline: deadline, checked: &atomic.Bool{}}
+	return &clone
 }
 
 func validate(cfg Config) error {

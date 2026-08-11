@@ -1,6 +1,6 @@
 # Streaming Measurement Core
 
-The Day 1 probe uses one request. `http.Client` manages network I/O internally,
+The probe uses one request. `http.Client` manages network I/O internally,
 and `time.AfterFunc` runs the idle-timeout callback in its own goroutine. That
 callback sends to a one-slot buffered `idleExpired` channel so it never blocks
 while the request goroutine is still inside a body read. Later load scenarios
@@ -11,9 +11,10 @@ shared locks.
 ## Clock Points
 
 Go `time.Time` values retain a monotonic component when created with
-`time.Now`. The probe stamps `start` immediately before `http.Client.Do` and
-computes all durations by subtraction, so wall-clock adjustments cannot skew
-the run.
+`time.Now`. The probe stamps `Result.Dispatch` immediately before
+`http.Client.Do` and computes all durations from that same clock point, so
+wall-clock adjustments cannot skew the run. `Result.Duration` is populated on
+both successful `[DONE]` completion and failures after dispatch.
 
 - **TTFB**: `GotFirstResponseByte - start`, captured by `httptrace`. This is a
   transport diagnostic and is never an SLO gate.
@@ -33,4 +34,6 @@ use `bufio.Scanner`, whose default token limit can reject a large event.
 An idle timer is reset after every complete SSE event. Total timeout and parent
 cancellation use the request context, which closes the response body and
 unblocks reads. Malformed JSON, premature EOF, or a stream with no semantic
-content is a request failure.
+content is a request failure. Probe errors wrap stable sentinels while retaining
+their existing human-readable text, allowing callers to classify failures with
+`errors.Is` without parsing response text.

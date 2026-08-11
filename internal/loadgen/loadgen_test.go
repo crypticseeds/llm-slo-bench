@@ -3,10 +3,13 @@ package loadgen
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -64,6 +67,47 @@ func TestRunAbsoluteDeadlinesDoNotDrift(t *testing.T) {
 	}
 }
 
+func TestRunUsesProbeDispatchForLagAndLateDrop(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requests.Add(1)
+	}))
+	defer server.Close()
+	cfg := testConfig(realClock{})
+	cfg.Load.Stages = []config.Stage{{Duration: duration(20 * time.Millisecond), TargetRPS: 100}}
+	cfg.MaxScheduleLag = 10 * time.Millisecond
+	cfg.Probe.Endpoint = server.URL
+	cfg.runner = func(ctx context.Context, probeCfg probe.Config) (probe.Result, error) {
+		select {
+		case <-time.After(20 * time.Millisecond):
+		case <-ctx.Done():
+			return probe.Result{}, ctx.Err()
+		}
+		return probe.Run(ctx, probeCfg)
+	}
+
+	result, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Outcomes) != 1 {
+		t.Fatalf("outcomes = %d, want 1", len(result.Outcomes))
+	}
+	outcome := result.Outcomes[0]
+	if outcome.Dispatch != outcome.Result.Dispatch || outcome.ScheduleLag <= cfg.MaxScheduleLag {
+		t.Fatalf("outcome = %+v, want probe-boundary dispatch beyond lateness limit", outcome)
+	}
+	if !outcome.Dropped || outcome.DropReason != DropLate || result.Counts.Dropped != 1 {
+		t.Fatalf("outcome = %+v counts = %+v, want late drop", outcome, result.Counts)
+	}
+	if result.Counts.Started != 0 || result.Counts.Completed != 0 || result.Counts.Failed != 0 || result.SafetyBudgetUSD != 0 || outcome.ErrorClass != ErrorNone || outcome.Error != "" {
+		t.Fatalf("result = %+v, want pre-network drop with released reservation", result)
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("server received %d requests, want overdue request rejected before RoundTrip", requests.Load())
+	}
+}
+
 func TestRunDropsInsteadOfQueueingWhenSaturated(t *testing.T) {
 	clk := &fakeClock{
 		now:         time.Unix(100, 0),
@@ -80,8 +124,12 @@ func TestRunDropsInsteadOfQueueingWhenSaturated(t *testing.T) {
 	cfg.Load.MaxInFlight = 1
 	cfg.runner = func(context.Context, probe.Config) (probe.Result, error) {
 		started <- struct{}{}
-		<-release
-		return probe.Result{}, nil
+		select {
+		case <-release:
+			return probe.Result{}, nil
+		case <-time.After(testWaitTimeout):
+			return probe.Result{}, errors.New("timed out waiting for test release")
+		}
 	}
 
 	done := make(chan Result, 1)
@@ -89,11 +137,11 @@ func TestRunDropsInsteadOfQueueingWhenSaturated(t *testing.T) {
 		result, _ := Run(context.Background(), cfg)
 		done <- result
 	}()
-	<-started
-	<-clk.waitBlocked
+	waitSignal(t, started, "first request to start")
+	waitSignal(t, clk.waitBlocked, "scheduler wait to block")
 	close(release)
 	close(clk.waitRelease)
-	result := <-done
+	result := waitValue(t, done, "Run to return")
 
 	if result.Counts.Scheduled != 4 || result.Counts.Started != 1 || result.Counts.Dropped != 3 {
 		t.Fatalf("counts = %+v, want scheduled=4 started=1 dropped=3", result.Counts)
@@ -136,6 +184,25 @@ func TestRunDropsArrivalsBeyondLatenessBound(t *testing.T) {
 	}
 }
 
+func TestRunCancellationWhileScheduleIsBehindPreventsDispatch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	clk := &cancellingClock{now: time.Unix(100, 0), cancel: cancel}
+	cfg := testConfig(clk)
+	called := false
+	cfg.runner = func(context.Context, probe.Config) (probe.Result, error) {
+		called = true
+		return probe.Result{Dispatch: clk.Now()}, nil
+	}
+
+	result, err := Run(ctx, cfg)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v, want context canceled", err)
+	}
+	if called || result.Counts.Scheduled != 0 || result.Counts.Started != 0 {
+		t.Fatalf("called=%t counts=%+v, want cancellation before admission", called, result.Counts)
+	}
+}
+
 func TestRunSafetyLimitsPreventNewDispatch(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -171,8 +238,12 @@ func TestRunSafetyLimitsPreventNewDispatch(t *testing.T) {
 			cfg.Load.MaxInFlight = 20
 			cfg.runner = func(context.Context, probe.Config) (probe.Result, error) {
 				started <- struct{}{}
-				<-block
-				return probe.Result{}, nil
+				select {
+				case <-block:
+					return probe.Result{}, nil
+				case <-time.After(testWaitTimeout):
+					return probe.Result{}, errors.New("timed out waiting for test release")
+				}
 			}
 			test.mutate(&cfg)
 
@@ -182,10 +253,10 @@ func TestRunSafetyLimitsPreventNewDispatch(t *testing.T) {
 				done <- result
 			}()
 			for i := 0; i < test.wantStarts; i++ {
-				<-started
+				waitSignal(t, started, "request to start")
 			}
 			close(block)
-			result := <-done
+			result := waitValue(t, done, "Run to return")
 
 			if result.Counts.Started != test.wantStarts || result.StopReason != test.wantReason {
 				t.Fatalf("started=%d stop=%q, want started=%d stop=%q", result.Counts.Started, result.StopReason, test.wantStarts, test.wantReason)
@@ -196,7 +267,7 @@ func TestRunSafetyLimitsPreventNewDispatch(t *testing.T) {
 
 func TestRunDurationLimitPreventsDispatch(t *testing.T) {
 	called := false
-	cfg := testConfig(&fakeClock{now: time.Unix(100, 0)})
+	cfg := testConfig(&fakeClock{now: time.Now()})
 	cfg.Load.Stages = []config.Stage{{Duration: duration(time.Second), TargetRPS: 20}}
 	cfg.Safety.MaxDuration = duration(100 * time.Millisecond)
 	cfg.runner = func(context.Context, probe.Config) (probe.Result, error) {
@@ -241,8 +312,28 @@ func TestNewHTTPClientIsBoundedAndHasHeaderTimeout(t *testing.T) {
 	}
 }
 
+func TestDispatchDeadlineTransportChecksOnlyInitialRoundTrip(t *testing.T) {
+	var calls atomic.Int32
+	base := roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Header: make(http.Header)}, nil
+	})
+	transport := dispatchDeadlineTransport{base: base, deadline: time.Now().Add(time.Second), checked: &atomic.Bool{}}
+	request := httptest.NewRequest(http.MethodGet, "http://example.test", nil)
+	if _, err := transport.RoundTrip(request); err != nil {
+		t.Fatal(err)
+	}
+	transport.deadline = time.Now().Add(-time.Second)
+	if _, err := transport.RoundTrip(request); err != nil {
+		t.Fatalf("redirect RoundTrip error = %v, want initial dispatch deadline only", err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("base transport calls = %d, want 2", calls.Load())
+	}
+}
+
 func TestRunReconcilesReservationsWithKnownCost(t *testing.T) {
-	cfg := testConfig(&fakeClock{now: time.Unix(100, 0)})
+	cfg := testConfig(&fakeClock{now: time.Now()})
 	cfg.Load.Stages = []config.Stage{{Duration: duration(time.Second), TargetRPS: 4}}
 	cfg.Safety.MaxCostUSD = 0.02
 	cfg.Safety.ReserveCostPerRequestUSD = 0.01
@@ -260,8 +351,48 @@ func TestRunReconcilesReservationsWithKnownCost(t *testing.T) {
 	}
 }
 
+func TestRunStopsOnCostReservationBreach(t *testing.T) {
+	clk := &fakeClock{
+		now:         time.Unix(100, 0),
+		blockAtWait: 2,
+		waitBlocked: make(chan struct{}),
+		waitRelease: make(chan struct{}),
+	}
+	cfg := testConfig(clk)
+	cfg.Load.Stages = []config.Stage{{Duration: duration(time.Second), TargetRPS: 4}}
+	cfg.Load.MaxInFlight = 1
+	cfg.Safety.ReserveCostPerRequestUSD = 0.01
+	cfg.Pricing.InputUSDPerMillionTokens = 1_000_000
+	var runnerCalls atomic.Int32
+	cfg.runner = func(context.Context, probe.Config) (probe.Result, error) {
+		runnerCalls.Add(1)
+		return probe.Result{
+			Usage: &probe.Usage{PromptTokens: 2},
+		}, nil
+	}
+
+	done := make(chan Result, 1)
+	go func() {
+		result, _ := Run(context.Background(), cfg)
+		done <- result
+	}()
+	waitSignal(t, clk.waitBlocked, "scheduler to reach second arrival")
+	close(clk.waitRelease)
+	result := waitValue(t, done, "Run to return")
+
+	if result.Counts.Started != 1 || runnerCalls.Load() != 1 || result.StopReason != StopCostReservationBreach {
+		t.Fatalf("result = %+v, want one start and reservation breach stop", result)
+	}
+	if clk.WaitCount() != 2 {
+		t.Fatalf("scheduler waits = %d, want next arrival reached before breach stopped dispatch", clk.WaitCount())
+	}
+	if result.KnownCostUSD != 2 || result.SafetyBudgetUSD != 2 {
+		t.Fatalf("known cost=%f safety budget=%f, want reconciled actual cost 2", result.KnownCostUSD, result.SafetyBudgetUSD)
+	}
+}
+
 func TestRunInvalidUsageDoesNotReleaseReservation(t *testing.T) {
-	cfg := testConfig(&fakeClock{now: time.Unix(100, 0)})
+	cfg := testConfig(&fakeClock{now: time.Now()})
 	cfg.Load.Stages = []config.Stage{{Duration: duration(time.Second), TargetRPS: 2}}
 	cfg.Load.MaxInFlight = 1
 	cfg.Safety.MaxCostUSD = 0.01
@@ -288,7 +419,7 @@ func TestRunClassifiesRequestErrors(t *testing.T) {
 	}{
 		{name: "timeout", runErr: context.DeadlineExceeded, want: ErrorTimeout},
 		{name: "network timeout", runErr: timeoutError{}, want: ErrorTimeout},
-		{name: "stream idle timeout", runErr: errors.New("stream idle timeout after 1s"), want: ErrorTimeout},
+		{name: "stream idle timeout", runErr: fmt.Errorf("stream idle timeout after 1s: %w", probe.ErrStreamIdleTimeout), want: ErrorTimeout},
 		{name: "http", runErr: errors.New("503"), statusCode: http.StatusServiceUnavailable, want: ErrorHTTP},
 		{name: "stream", runErr: errors.New("malformed event"), statusCode: http.StatusOK, want: ErrorStream},
 	}
@@ -307,6 +438,29 @@ func TestRunClassifiesRequestErrors(t *testing.T) {
 				t.Fatalf("error class = %q, want %q", result.Outcomes[0].ErrorClass, test.want)
 			}
 		})
+	}
+}
+
+func TestRunSanitizesAndBoundsRequestErrors(t *testing.T) {
+	const secret = "provider response containing a private prompt"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, secret, http.StatusBadGateway)
+	}))
+	defer server.Close()
+	cfg := testConfig(&fakeClock{now: time.Now()})
+	cfg.Probe.Endpoint = server.URL
+	cfg.runner = nil
+
+	result, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := result.Outcomes[0].Error
+	if strings.Contains(got, secret) || len(got) > maxErrorMessageBytes {
+		t.Fatalf("stored error = %q, want bounded sanitized text", got)
+	}
+	if result.Outcomes[0].ErrorClass != ErrorHTTP {
+		t.Fatalf("error class = %q, want %q", result.Outcomes[0].ErrorClass, ErrorHTTP)
 	}
 }
 
@@ -348,7 +502,7 @@ func TestRunCancellationDrainsProbeAgainstMockServer(t *testing.T) {
 	defer server.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cfg := testConfig(&fakeClock{now: time.Unix(100, 0)})
+	cfg := testConfig(&fakeClock{now: time.Now()})
 	cfg.Load.Stages = []config.Stage{{Duration: duration(time.Second), TargetRPS: 2}}
 	cfg.Load.MaxInFlight = 1
 	cfg.Probe = probe.Config{
@@ -370,9 +524,9 @@ func TestRunCancellationDrainsProbeAgainstMockServer(t *testing.T) {
 		result, err := Run(ctx, cfg)
 		done <- runReturn{result: result, err: err}
 	}()
-	<-requestStarted
+	waitSignal(t, requestStarted, "mock request to start")
 	cancel()
-	returned := <-done
+	returned := waitValue(t, done, "cancelled Run to return")
 
 	if !errors.Is(returned.err, context.Canceled) {
 		t.Fatalf("Run() error = %v, want context canceled", returned.err)
@@ -393,7 +547,7 @@ func TestRunExecutesProbeAgainstMockServer(t *testing.T) {
 	}))
 	defer server.Close()
 
-	cfg := testConfig(&fakeClock{now: time.Unix(100, 0)})
+	cfg := testConfig(&fakeClock{now: time.Now()})
 	cfg.Load.Stages = []config.Stage{{Duration: duration(time.Second), TargetRPS: 2}}
 	cfg.Probe = probe.Config{
 		Endpoint:            server.URL + "/v1/chat/completions",
@@ -427,6 +581,18 @@ type fakeClock struct {
 	lateBy      time.Duration
 }
 
+func (c *fakeClock) Advance(delta time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(delta)
+}
+
+func (c *fakeClock) WaitCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.waitCount
+}
+
 func (c *fakeClock) Now() time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -445,7 +611,13 @@ func (c *fakeClock) WaitUntil(ctx context.Context, deadline time.Time) error {
 	c.mu.Unlock()
 	if wait == c.blockAtWait {
 		close(c.waitBlocked)
-		<-c.waitRelease
+		select {
+		case <-c.waitRelease:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(testWaitTimeout):
+			return errors.New("timed out waiting for fake clock release")
+		}
 	}
 	c.mu.Lock()
 	lateness := c.lateness
@@ -455,12 +627,38 @@ func (c *fakeClock) WaitUntil(ctx context.Context, deadline time.Time) error {
 	c.now = deadline.Add(lateness)
 	c.mu.Unlock()
 	if c.waited != nil {
-		c.waited <- deadline
+		select {
+		case c.waited <- deadline:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(testWaitTimeout):
+			return errors.New("timed out recording fake clock deadline")
+		}
 	}
 	return nil
 }
 
+type cancellingClock struct {
+	now    time.Time
+	cancel context.CancelFunc
+}
+
+func (c *cancellingClock) Now() time.Time {
+	return c.now
+}
+
+func (c *cancellingClock) WaitUntil(context.Context, time.Time) error {
+	c.cancel()
+	return nil
+}
+
 type timeoutError struct{}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return fn(request)
+}
 
 func (timeoutError) Error() string   { return "network timeout" }
 func (timeoutError) Timeout() bool   { return true }
@@ -514,4 +712,27 @@ func differenceCost(left, right float64) float64 {
 		return right - left
 	}
 	return left - right
+}
+
+const testWaitTimeout = time.Second
+
+func waitSignal(t *testing.T, signal <-chan struct{}, description string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(testWaitTimeout):
+		t.Fatalf("timed out waiting for %s", description)
+	}
+}
+
+func waitValue[T any](t *testing.T, values <-chan T, description string) T {
+	t.Helper()
+	select {
+	case value := <-values:
+		return value
+	case <-time.After(testWaitTimeout):
+		t.Fatalf("timed out waiting for %s", description)
+		var zero T
+		return zero
+	}
 }

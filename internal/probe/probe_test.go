@@ -68,7 +68,7 @@ func TestRunRejectsMalformedStream(t *testing.T) {
 	server := httptest.NewServer(mockserver.NewHandler(cfg))
 	defer server.Close()
 
-	_, err := Run(context.Background(), Config{
+	result, err := Run(context.Background(), Config{
 		Endpoint:            server.URL + "/v1/chat/completions",
 		Model:               "mock-model",
 		Prompt:              "hello",
@@ -78,6 +78,9 @@ func TestRunRejectsMalformedStream(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "decode OpenAI stream event") {
 		t.Fatalf("Run() error = %v, want malformed event error", err)
+	}
+	if !errors.Is(err, ErrDecodeEvent) || result.Dispatch.IsZero() || result.Duration <= 0 {
+		t.Fatalf("result=%+v error=%v, want typed decode error with failure timing", result, err)
 	}
 }
 
@@ -136,7 +139,7 @@ func TestRunReturnsIdleTimeoutForStalledStream(t *testing.T) {
 	server := httptest.NewServer(mockserver.NewHandler(cfg))
 	defer server.Close()
 
-	_, err := Run(context.Background(), Config{
+	result, err := Run(context.Background(), Config{
 		Endpoint:            server.URL + "/v1/chat/completions",
 		Model:               "mock-model",
 		Prompt:              "hello",
@@ -146,6 +149,9 @@ func TestRunReturnsIdleTimeoutForStalledStream(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "stream idle timeout") {
 		t.Fatalf("Run() error = %v, want idle timeout", err)
+	}
+	if !errors.Is(err, ErrStreamIdleTimeout) || result.Dispatch.IsZero() || result.Duration <= 0 {
+		t.Fatalf("result=%+v error=%v, want typed idle error with failure timing", result, err)
 	}
 }
 
@@ -201,7 +207,10 @@ func TestRunHonorsParentCancellation(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		w.(http.Flusher).Flush()
 		close(started)
-		<-r.Context().Done()
+		select {
+		case <-r.Context().Done():
+		case <-time.After(time.Second):
+		}
 	}))
 	defer server.Close()
 
@@ -218,7 +227,11 @@ func TestRunHonorsParentCancellation(t *testing.T) {
 		})
 		done <- err
 	}()
-	<-started
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for request to start")
+	}
 	cancel()
 	select {
 	case err := <-done:
