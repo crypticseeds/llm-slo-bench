@@ -30,6 +30,7 @@ type Outcome string
 const (
 	OutcomeSuccess     Outcome = "success"
 	OutcomeDropped     Outcome = "dropped"
+	OutcomeCanceled    Outcome = "canceled"
 	OutcomeTimeout     Outcome = "timeout"
 	OutcomeStreamError Outcome = "stream_error"
 	OutcomeHTTPError   Outcome = "http_error"
@@ -45,6 +46,7 @@ type Counts struct {
 	Started     int64   `json:"started"`
 	Success     int64   `json:"success"`
 	Dropped     int64   `json:"dropped"`
+	Canceled    int64   `json:"canceled"`
 	Timeout     int64   `json:"timeout"`
 	StreamError int64   `json:"stream_error"`
 	HTTPError   int64   `json:"http_error"`
@@ -136,8 +138,8 @@ type closeCommand struct {
 }
 
 func NewAggregator(pricing Pricing) (*Aggregator, error) {
-	if pricing.InputUSDPerMillionTokens < 0 || pricing.OutputUSDPerMillionTokens < 0 {
-		return nil, errors.New("token prices must not be negative")
+	if !validPrice(pricing.InputUSDPerMillionTokens) || !validPrice(pricing.OutputUSDPerMillionTokens) {
+		return nil, errors.New("token prices must be finite and non-negative")
 	}
 	aggregator := &Aggregator{commands: make(chan any)}
 	go aggregator.run(pricing)
@@ -301,7 +303,14 @@ func ClassifyOutcome(result probe.Result, requestErr error) Outcome {
 		requestErr != nil && strings.HasPrefix(requestErr.Error(), "stream idle timeout after ") {
 		return OutcomeTimeout
 	}
+	if errors.Is(requestErr, context.Canceled) {
+		return OutcomeCanceled
+	}
 	return OutcomeStreamError
+}
+
+func validPrice(price float64) bool {
+	return price >= 0 && !math.IsNaN(price) && !math.IsInf(price, 0)
 }
 
 type metricValues struct {
@@ -422,6 +431,8 @@ func (s *aggregateState) incrementOutcome(outcome Outcome) {
 	switch outcome {
 	case OutcomeSuccess:
 		s.counts.Success++
+	case OutcomeCanceled:
+		s.counts.Canceled++
 	case OutcomeTimeout:
 		s.counts.Timeout++
 	case OutcomeHTTPError:

@@ -84,6 +84,29 @@ func TestOpenJSONLAppendsInsteadOfTruncating(t *testing.T) {
 	}
 }
 
+func TestOpenJSONLTightensExistingFilePermissions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "requests.jsonl")
+	if err := os.WriteFile(path, []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	writer, err := OpenJSONL(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = writer.Close() })
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("permissions = %o, want 600", info.Mode().Perm())
+	}
+}
+
 func TestOpenJSONLRejectsIncompleteExistingRecord(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "requests.jsonl")
 	if err := os.WriteFile(path, []byte(`{"schema_version":1}`), 0o600); err != nil {

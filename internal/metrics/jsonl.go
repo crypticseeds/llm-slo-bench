@@ -40,6 +40,10 @@ func OpenJSONL(path string) (*JSONLWriter, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open request JSONL: %w", err)
 	}
+	if err := file.Chmod(0o600); err != nil {
+		file.Close()
+		return nil, fmt.Errorf("set request JSONL permissions: %w", err)
+	}
 	info, err := file.Stat()
 	if err != nil {
 		file.Close()

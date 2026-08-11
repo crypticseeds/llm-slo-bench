@@ -152,9 +152,20 @@ func TestAggregatorRejectsHistogramOverflowWithoutMutation(t *testing.T) {
 	}
 }
 
-func TestNewAggregatorRejectsNegativePricing(t *testing.T) {
-	if _, err := NewAggregator(Pricing{InputUSDPerMillionTokens: -1}); err == nil {
-		t.Fatal("NewAggregator() error = nil, want negative price error")
+func TestNewAggregatorRejectsInvalidPricing(t *testing.T) {
+	tests := map[string]Pricing{
+		"negative input":  {InputUSDPerMillionTokens: -1},
+		"NaN input":       {InputUSDPerMillionTokens: math.NaN()},
+		"infinite input":  {InputUSDPerMillionTokens: math.Inf(1)},
+		"NaN output":      {OutputUSDPerMillionTokens: math.NaN()},
+		"infinite output": {OutputUSDPerMillionTokens: math.Inf(1)},
+	}
+	for name, pricing := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, err := NewAggregator(pricing); err == nil {
+				t.Fatal("NewAggregator() error = nil, want invalid price error")
+			}
+		})
 	}
 }
 
@@ -163,6 +174,25 @@ func TestClassifyOutcomeRecognizesProbeIdleTimeout(t *testing.T) {
 	if got != OutcomeTimeout {
 		t.Fatalf("ClassifyOutcome() = %q, want %q", got, OutcomeTimeout)
 	}
+}
+
+func TestAggregatorTracksCancellationWithoutCountingItAsError(t *testing.T) {
+	aggregator := newTestAggregator(t)
+	for _, requestErr := range []error{context.Canceled, context.DeadlineExceeded} {
+		if err := aggregator.Record(probe.Result{}, requestErr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := aggregator.RecordDropped(); err != nil {
+		t.Fatal(err)
+	}
+
+	summary := aggregator.Summary()
+	if summary.Counts.Canceled != 1 || summary.Counts.Timeout != 1 {
+		t.Fatalf("Counts = %#v, want one cancellation and one timeout", summary.Counts)
+	}
+	assertNear(t, summary.Counts.ErrorRate, 1.0/3.0, 1e-12)
+	assertNear(t, summary.Counts.DroppedRate, 1.0/3.0, 1e-12)
 }
 
 func TestAggregatorCloseReturnsFinalSummaryAndRejectsNewRecords(t *testing.T) {
