@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "counts": {
+    "scheduled": 10,
+    "started": 9,
+    "success": 5,
+    "dropped": 1,
+    "canceled": 1,
+    "timeout": 1,
+    "stream_error": 1,
+    "http_error": 1,
+    "error_rate": 0.3,
+    "dropped_rate": 0.1
+  },
+  "metrics": {
+    "ttfb": {
+      "count": 5,
+      "min": 2.5,
+      "max": 4.25,
+      "mean": 3.3,
+      "p50": 3.5,
+      "p90": 4,
+      "p95": 4.1,
+      "p99": 4.2,
+      "lowest_trackable": 0.001,
+      "highest_trackable": 3600000,
+      "significant_figures": 3,
+      "unit": "ms"
+    },
+    "ttft": {
+      "count": 5,
+      "min": 12.5,
+      "max": 40,
+      "mean": 24.75,
+      "p50": 25,
+      "p90": 38,
+      "p95": 39,
+      "p99": 40,
+      "lowest_trackable": 0.001,
+      "highest_trackable": 3600000,
+      "significant_figures": 3,
+      "unit": "ms"
+    },
+    "chunk_itl": {
+      "count": 15,
+      "min": 3,
+      "max": 10,
+      "mean": 5.4,
+      "p50": 5,
+      "p90": 8,
+      "p95": 9,
+      "p99": 10,
+      "lowest_trackable": 0.001,
+      "highest_trackable": 3600000,
+      "significant_figures": 3,
+      "unit": "ms"
+    },
+    "request_duration": {
+      "count": 5,
+      "min": 112.5,
+      "max": 160,
+      "mean": 134.2,
+      "p50": 130,
+      "p90": 155,
+      "p95": 158,
+      "p99": 160,
+      "lowest_trackable": 0.001,
+      "highest_trackable": 3600000,
+      "significant_figures": 3,
+      "unit": "ms"
+    },
+    "tokens_per_second": {
+      "count": 5,
+      "min": 44,
+      "max": 60,
+      "mean": 52,
+      "p50": 52,
+      "p90": 59,
+      "p95": 60,
+      "p99": 60,
+      "lowest_trackable": 0.001,
+      "highest_trackable": 3600000,
+      "significant_figures": 3,
+      "unit": "tokens_per_second"
+    }
+  },
+  "usage": {
+    "samples": 4,
+    "complete": false,
+    "prompt_tokens": 320,
+    "completion_tokens": 80,
+    "total_tokens": 400,
+    "cost_usd": 0.000042
+  }
+}

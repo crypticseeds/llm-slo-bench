@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>llm-slo-bench report</title>
+<style>
+:root{color-scheme:dark;--bg:#0b0d10;--panel:#14181d;--ink:#f2f0e9;--muted:#9da6b0;--line:#303843;--accent:#55d6be;--pending:#f4b942;--bad:#ff7a90}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace}main{max-width:1180px;margin:auto;padding:40px 24px 80px}header{border-bottom:1px solid var(--line);padding-bottom:24px}h1{font-size:clamp(30px,6vw,58px);line-height:1;margin:10px 0 14px;letter-spacing:-.04em}h2{font-size:15px;letter-spacing:.08em;text-transform:uppercase;margin:42px 0 14px}.eyebrow,.muted{color:var(--muted)}.eyebrow{letter-spacing:.12em;text-transform:uppercase}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1px;background:var(--line);border:1px solid var(--line)}.cell{background:var(--panel);padding:15px;min-width:0}.label{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px}.value{font-size:18px;overflow-wrap:anywhere}.pending{color:var(--pending)}.complete{color:var(--accent)}.partial,.unavailable{color:var(--pending)}.note{border-left:3px solid var(--pending);background:var(--panel);padding:13px 15px;margin:12px 0}.table-wrap{overflow:auto;border:1px solid var(--line)}table{border-collapse:collapse;width:100%;min-width:860px}th,td{text-align:right;padding:10px 12px;border-bottom:1px solid var(--line);white-space:nowrap}th:first-child,td:first-child{text-align:left}th{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.06em;background:var(--panel)}tr:last-child td{border-bottom:0}.empty{text-align:left;color:var(--muted)}details{border:1px solid var(--line);background:var(--panel)}summary{cursor:pointer;padding:14px}.details-body{padding:0 14px 14px}.requests{min-width:1100px}footer{margin-top:42px;color:var(--muted);font-size:12px}@media(max-width:600px){main{padding:24px 14px 60px}h1{font-size:34px}}
+</style>
+</head>
+<body><main>
+<header><div class="eyebrow">llm-slo-bench / schema v1</div><h1>Inference run report</h1><div class="muted">Portable report rendered from one immutable metrics summary.</div></header>
+<h2>Run metadata</h2>
+<div class="grid">
+<div class="cell"><span class="label">Run ID</span><span class="value">run-20260811-01</span></div>
+<div class="cell"><span class="label">Scenario</span><span class="value">ramp</span></div>
+<div class="cell"><span class="label">Target</span><span class="value">mock.local</span></div>
+<div class="cell"><span class="label">Model</span><span class="value">mock-model</span></div>
+<div class="cell"><span class="label">Started</span><span class="value">2026-08-11T13:30:00Z</span></div>
+<div class="cell"><span class="label">Duration</span><span class="value">45s</span></div>
+<div class="cell"><span class="label">Config fingerprint</span><span class="value">sha256:abc123</span></div>
+</div>
+<h2>SLO gates</h2>
+<div class="note"><strong class="pending">PENDING</strong> SLO evaluation is not attached to this metrics summary. This report does not infer or fabricate pass/fail results.</div>
+<h2>Outcomes</h2>
+<div class="grid">
+<div class="cell"><span class="label">Scheduled</span><span class="value">10</span></div>
+<div class="cell"><span class="label">Started</span><span class="value">9</span></div>
+<div class="cell"><span class="label">Success</span><span class="value">5</span></div>
+<div class="cell"><span class="label">Dropped</span><span class="value">1</span></div>
+<div class="cell"><span class="label">Canceled</span><span class="value">1</span></div>
+<div class="cell"><span class="label">Timeout</span><span class="value">1</span></div>
+<div class="cell"><span class="label">Stream error</span><span class="value">1</span></div>
+<div class="cell"><span class="label">HTTP error</span><span class="value">1</span></div>
+<div class="cell"><span class="label">Error rate</span><span class="value">30.00%</span></div>
+<div class="cell"><span class="label">Drop rate</span><span class="value">10.00%</span></div>
+</div>
+
+<h2>Histogram summaries</h2>
+<div class="table-wrap"><table><thead><tr><th>Metric</th><th>Count</th><th>Min</th><th>Mean</th><th>P50</th><th>P90</th><th>P95</th><th>P99</th><th>Max</th><th>Unit</th></tr></thead><tbody>
+<tr><td>TTFB</td><td>5</td><td>2.500</td><td>3.300</td><td>3.500</td><td>4.000</td><td>4.100</td><td>4.200</td><td>4.250</td><td>ms</td></tr><tr><td>TTFT</td><td>5</td><td>12.500</td><td>24.750</td><td>25.000</td><td>38.000</td><td>39.000</td><td>40.000</td><td>40.000</td><td>ms</td></tr><tr><td>Chunk ITL</td><td>15</td><td>3.000</td><td>5.400</td><td>5.000</td><td>8.000</td><td>9.000</td><td>10.000</td><td>10.000</td><td>ms</td></tr><tr><td>Request duration</td><td>5</td><td>112.500</td><td>134.200</td><td>130.000</td><td>155.000</td><td>158.000</td><td>160.000</td><td>160.000</td><td>ms</td></tr><tr><td>Tokens per second</td><td>5</td><td>44.000</td><td>52.000</td><td>52.000</td><td>59.000</td><td>60.000</td><td>60.000</td><td>60.000</td><td>tokens_per_second</td></tr>
+</tbody></table></div>
+<h2>Usage and cost</h2>
+<div class="grid">
+<div class="cell"><span class="label">Usage status</span><span class="value partial">partial</span></div>
+<div class="cell"><span class="label">Usage samples</span><span class="value">4</span></div>
+<div class="cell"><span class="label">Prompt tokens</span><span class="value">320</span></div>
+<div class="cell"><span class="label">Completion tokens</span><span class="value">80</span></div>
+<div class="cell"><span class="label">Total tokens</span><span class="value">400</span></div>
+<div class="cell"><span class="label">Cost</span><span class="value">$0.000042</span></div>
+</div>
+<div class="note">Usage is incomplete; token and cost totals include only requests with authoritative usage.</div>
+<h2>Per-request details</h2><details><summary>Request records from requests.jsonl</summary><div class="details-body"><div class="table-wrap"><table class="requests"><thead><tr><th>#</th><th>Outcome</th><th>HTTP</th><th>TTFB</th><th>TTFT</th><th>Chunk ITL</th><th>Duration</th><th>Usage</th><th>Prompt tokens</th><th>Completion tokens</th><th>Total tokens</th></tr></thead><tbody>
+<tr><td>1</td><td>success</td><td>200</td><td>2.500 ms</td><td>12.500 ms</td><td>3.000 ms, 4.000 ms</td><td>112.500 ms</td><td>available</td><td>80</td><td>20</td><td>100</td></tr>
+<tr><td>2</td><td>canceled</td><td>0</td><td>unavailable</td><td>unavailable</td><td>unavailable</td><td>unavailable</td><td>unavailable</td><td>unavailable</td><td>unavailable</td><td>unavailable</td></tr>
+</tbody></table></div></div></details>
+<footer>Generated by llm-slo-bench. This file contains no external assets or network requests.</footer>
+</main></body></html>
