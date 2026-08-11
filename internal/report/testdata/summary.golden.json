@@ -213,5 +213,6 @@
     "completion_tokens": 80,
     "total_tokens": 400,
     "cost_usd": 0.000042
-  }
+  },
+  "slo_outcomes": null
 }
