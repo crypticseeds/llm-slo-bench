@@ -402,8 +402,8 @@ func decodeRequestRecordLine(line []byte) (metrics.RequestRecord, error) {
 	if len(bytes.TrimSpace(line)) == 0 {
 		return metrics.RequestRecord{}, errors.New("blank lines are not valid records")
 	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(line, &fields); err != nil {
+	fields, err := decodeUniqueObject(line)
+	if err != nil {
 		return metrics.RequestRecord{}, fmt.Errorf("decode JSON object: %w", err)
 	}
 	required := []string{"schema_version", "outcome", "status_code", "ttfb_micros", "ttft_micros", "chunk_itl_micros", "duration_micros", "usage_status", "usage"}
@@ -457,8 +457,8 @@ func validateRequestRecord(record metrics.RequestRecord, rawUsage json.RawMessag
 	if record.Outcome == metrics.OutcomeSuccess && record.StatusCode != 200 {
 		return errors.New("success outcome requires status_code 200")
 	}
-	if record.Outcome == metrics.OutcomeHTTPError && (record.StatusCode < 100 || record.StatusCode > 599 || record.StatusCode == 200) {
-		return errors.New("http_error outcome requires a non-200 HTTP status_code")
+	if record.Outcome == metrics.OutcomeHTTPError && (record.StatusCode == 0 || record.StatusCode == 200) {
+		return errors.New("http_error outcome requires a nonzero, non-200 status_code")
 	}
 	if record.Outcome == metrics.OutcomeDropped && record.StatusCode != 0 {
 		return errors.New("dropped outcome requires status_code 0")
@@ -469,13 +469,13 @@ func validateRequestRecord(record metrics.RequestRecord, rawUsage json.RawMessag
 	for name, value := range map[string]*int64{
 		"ttfb_micros": record.TTFBMicros, "ttft_micros": record.TTFTMicros, "duration_micros": record.DurationMicros,
 	} {
-		if value != nil && *value <= 0 {
-			return fmt.Errorf("%s must be positive when present", name)
+		if value != nil && (*value < metrics.LowestTrackableMicros || *value > metrics.HighestTrackableMicros) {
+			return fmt.Errorf("%s must be between %d and %d when present", name, metrics.LowestTrackableMicros, metrics.HighestTrackableMicros)
 		}
 	}
 	for _, value := range record.ChunkITLMicros {
-		if value <= 0 {
-			return errors.New("chunk_itl_micros values must be positive")
+		if value < metrics.LowestTrackableMicros || value > metrics.HighestTrackableMicros {
+			return fmt.Errorf("chunk_itl_micros values must be between %d and %d", metrics.LowestTrackableMicros, metrics.HighestTrackableMicros)
 		}
 	}
 	if record.UsageStatus != "available" && record.UsageStatus != "unavailable" {
@@ -493,8 +493,8 @@ func validateRequestRecord(record metrics.RequestRecord, rawUsage json.RawMessag
 }
 
 func validateUsage(raw json.RawMessage, usage *probe.Usage) error {
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &fields); err != nil {
+	fields, err := decodeUniqueObject(raw)
+	if err != nil {
 		return fmt.Errorf("decode usage: %w", err)
 	}
 	for _, name := range []string{"prompt_tokens", "completion_tokens", "total_tokens"} {
@@ -513,6 +513,43 @@ func validateUsage(raw json.RawMessage, usage *probe.Usage) error {
 		return errors.New("usage token counts must be non-negative")
 	}
 	return nil
+}
+
+func decodeUniqueObject(data []byte) (map[string]json.RawMessage, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	token, err := decoder.Token()
+	if err != nil {
+		return nil, err
+	}
+	if token != json.Delim('{') {
+		return nil, errors.New("value must be an object")
+	}
+	fields := make(map[string]json.RawMessage)
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return nil, err
+		}
+		name, ok := token.(string)
+		if !ok {
+			return nil, errors.New("object field name must be a string")
+		}
+		if _, exists := fields[name]; exists {
+			return nil, fmt.Errorf("duplicate field %q", name)
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return nil, err
+		}
+		fields[name] = value
+	}
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	}
+	if err := requireDecoderEOF(decoder); err != nil {
+		return nil, err
+	}
+	return fields, nil
 }
 
 func metadataFor(metadata Metadata) metadataView {

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/crypticseeds/llm-slo-bench/internal/metrics"
+	"github.com/crypticseeds/llm-slo-bench/internal/probe"
 )
 
 var update = flag.Bool("update", false, "update golden files")
@@ -178,22 +179,30 @@ func TestWriteHTMLReturnsJSONLReadError(t *testing.T) {
 func TestWriteHTMLRejectsMalformedJSONLContractsBeforeOutput(t *testing.T) {
 	valid := strings.TrimSuffix(validRequestJSONL(), "\n")
 	tests := map[string]string{
-		"missing required field":  strings.Replace(valid, `,"outcome":"success"`, "", 1) + "\n",
-		"null required field":     strings.Replace(valid, `"status_code":200`, `"status_code":null`, 1) + "\n",
-		"unsupported schema":      strings.Replace(valid, `"schema_version":1`, `"schema_version":2`, 1) + "\n",
-		"unknown field":           strings.Replace(valid, `"schema_version":1`, `"schema_version":1,"extra":true`, 1) + "\n",
-		"unknown usage field":     strings.Replace(valid, `"total_tokens":100`, `"total_tokens":100,"extra":true`, 1) + "\n",
-		"invalid outcome":         strings.Replace(valid, `"outcome":"success"`, `"outcome":"other"`, 1) + "\n",
-		"invalid status":          strings.Replace(valid, `"status_code":200`, `"status_code":500`, 1) + "\n",
-		"invalid usage status":    strings.Replace(valid, `"usage_status":"available"`, `"usage_status":"partial"`, 1) + "\n",
-		"usage mismatch":          strings.Replace(valid, `"usage_status":"available"`, `"usage_status":"unavailable"`, 1) + "\n",
-		"missing usage field":     strings.Replace(valid, `"prompt_tokens":80,`, "", 1) + "\n",
-		"null prompt tokens":      strings.Replace(valid, `"prompt_tokens":80`, `"prompt_tokens":null`, 1) + "\n",
-		"null completion tokens":  strings.Replace(valid, `"completion_tokens":20`, `"completion_tokens":null`, 1) + "\n",
-		"null total tokens":       strings.Replace(valid, `"total_tokens":100`, `"total_tokens":null`, 1) + "\n",
-		"two records on one line": valid + valid + "\n",
-		"blank line":              "\n",
-		"unterminated final line": valid,
+		"missing required field":    strings.Replace(valid, `,"outcome":"success"`, "", 1) + "\n",
+		"null required field":       strings.Replace(valid, `"status_code":200`, `"status_code":null`, 1) + "\n",
+		"unsupported schema":        strings.Replace(valid, `"schema_version":1`, `"schema_version":2`, 1) + "\n",
+		"unknown field":             strings.Replace(valid, `"schema_version":1`, `"schema_version":1,"extra":true`, 1) + "\n",
+		"duplicate top-level field": strings.Replace(valid, `"schema_version":1`, `"schema_version":1,"schema_version":1`, 1) + "\n",
+		"unknown usage field":       strings.Replace(valid, `"total_tokens":100`, `"total_tokens":100,"extra":true`, 1) + "\n",
+		"duplicate usage field":     strings.Replace(valid, `"prompt_tokens":80`, `"prompt_tokens":80,"prompt_tokens":80`, 1) + "\n",
+		"invalid outcome":           strings.Replace(valid, `"outcome":"success"`, `"outcome":"other"`, 1) + "\n",
+		"invalid status":            strings.Replace(valid, `"status_code":200`, `"status_code":500`, 1) + "\n",
+		"http status zero":          httpErrorJSONL(valid, 0),
+		"http status success":       httpErrorJSONL(valid, 200),
+		"ttfb timing overflow":      strings.Replace(valid, `"ttfb_micros":2500`, `"ttfb_micros":3600000001`, 1) + "\n",
+		"ttft timing overflow":      strings.Replace(valid, `"ttft_micros":12500`, `"ttft_micros":3600000001`, 1) + "\n",
+		"chunk itl timing overflow": strings.Replace(valid, `"chunk_itl_micros":[3000,4000]`, `"chunk_itl_micros":[3600000001]`, 1) + "\n",
+		"duration timing overflow":  strings.Replace(valid, `"duration_micros":112500`, `"duration_micros":3600000001`, 1) + "\n",
+		"invalid usage status":      strings.Replace(valid, `"usage_status":"available"`, `"usage_status":"partial"`, 1) + "\n",
+		"usage mismatch":            strings.Replace(valid, `"usage_status":"available"`, `"usage_status":"unavailable"`, 1) + "\n",
+		"missing usage field":       strings.Replace(valid, `"prompt_tokens":80,`, "", 1) + "\n",
+		"null prompt tokens":        strings.Replace(valid, `"prompt_tokens":80`, `"prompt_tokens":null`, 1) + "\n",
+		"null completion tokens":    strings.Replace(valid, `"completion_tokens":20`, `"completion_tokens":null`, 1) + "\n",
+		"null total tokens":         strings.Replace(valid, `"total_tokens":100`, `"total_tokens":null`, 1) + "\n",
+		"two records on one line":   valid + valid + "\n",
+		"blank line":                "\n",
+		"unterminated final line":   valid,
 	}
 	for name, contents := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -324,6 +333,36 @@ func TestStrictContractAcceptsProducerStreamFailureStatus(t *testing.T) {
 	}
 }
 
+func TestStrictContractAcceptsHTTPStatusBoundaries(t *testing.T) {
+	valid := strings.TrimSuffix(validRequestJSONL(), "\n")
+	for _, statusCode := range []int{-1, 1, 99, 100, 199, 201, 599, 600, 999, 1000} {
+		if _, err := decodeRequestRecordLine([]byte(httpErrorJSONL(valid, statusCode))); err != nil {
+			t.Errorf("http_error status %d rejected: %v", statusCode, err)
+		}
+	}
+}
+
+func TestProducerRequestRecordPassesReportValidation(t *testing.T) {
+	var jsonl bytes.Buffer
+	result := probe.Result{
+		StatusCode: 699,
+		TTFB:       time.Hour,
+		TTFT:       time.Hour,
+		ChunkITL:   []time.Duration{time.Hour},
+		Duration:   time.Hour,
+	}
+	if err := metrics.NewJSONLWriter(&jsonl).WriteResult(result, errors.New("provider error")); err != nil {
+		t.Fatal(err)
+	}
+	record, err := decodeRequestRecordLine(jsonl.Bytes())
+	if err != nil {
+		t.Fatalf("report rejected producer record: %v\n%s", err, jsonl.String())
+	}
+	if record.Outcome != metrics.OutcomeHTTPError || record.StatusCode != 699 {
+		t.Fatalf("validated record = %#v, want producer http_error status 699", record)
+	}
+}
+
 func TestWriteHTMLReturnsJSONLOpenError(t *testing.T) {
 	var output bytes.Buffer
 	err := WriteHTML(&output, metrics.RunSummary{}, HTMLOptions{RequestJSONLPath: filepath.Join(t.TempDir(), "missing.jsonl")})
@@ -446,6 +485,12 @@ func histogram(count int64, min, max, mean, p50, p90, p95, p99 float64) *metrics
 
 func validRequestJSONL() string {
 	return `{"schema_version":1,"outcome":"success","status_code":200,"ttfb_micros":2500,"ttft_micros":12500,"chunk_itl_micros":[3000,4000],"duration_micros":112500,"usage_status":"available","usage":{"prompt_tokens":80,"completion_tokens":20,"total_tokens":100}}` + "\n"
+}
+
+func httpErrorJSONL(valid string, statusCode int) string {
+	line := strings.Replace(valid, `"outcome":"success"`, `"outcome":"http_error"`, 1)
+	line = strings.Replace(line, `"status_code":200`, `"status_code":`+strconv.Itoa(statusCode), 1)
+	return line + "\n"
 }
 
 func assertGolden(t *testing.T, name string, got []byte) {
