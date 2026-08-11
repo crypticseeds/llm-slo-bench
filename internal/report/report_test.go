@@ -423,7 +423,8 @@ func ExampleWriteJSON() {
 	//     "completion_tokens": 0,
 	//     "total_tokens": 0,
 	//     "cost_usd": null
-	//   }
+	//   },
+	//   "slo_outcomes": null
 	// }
 }
 
