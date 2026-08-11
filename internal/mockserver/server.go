@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"sync/atomic"
 	"time"
@@ -84,6 +85,9 @@ func Serve(ctx context.Context, cfg Config) error {
 		Addr:              cfg.Address,
 		Handler:           NewHandler(cfg),
 		ReadHeaderTimeout: 5 * time.Second,
+		BaseContext: func(net.Listener) context.Context {
+			return ctx
+		},
 	}
 
 	// The server runs in one goroutine while the caller waits on either its
@@ -113,6 +117,7 @@ func Serve(ctx context.Context, cfg Config) error {
 	}
 }
 
+// NewHandler returns the mock API handler. Callers must validate cfg first.
 func NewHandler(cfg Config) http.Handler {
 	mux := http.NewServeMux()
 	var requestNumber atomic.Uint64

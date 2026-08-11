@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "counts": {
+    "scheduled": 1,
+    "started": 1,
+    "success": 1,
+    "dropped": 0,
+    "canceled": 0,
+    "timeout": 0,
+    "stream_error": 0,
+    "http_error": 0,
+    "error_rate": 0,
+    "dropped_rate": 0
+  },
+  "metrics": {
+    "ttfb": null,
+    "ttft": null,
+    "chunk_itl": null,
+    "request_duration": null,
+    "tokens_per_second": null
+  },
+  "usage": {
+    "samples": 0,
+    "complete": false,
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 0,
+    "cost_usd": null
+  },
+  "slo_outcomes": [
+    {
+      "metric": "p99_ttft_ms",
+      "observed": 12.5,
+      "operator": "\u003c=",
+      "threshold": 800,
+      "sample_count": 1,
+      "status": "pending",
+      "pass": null
+    }
+  ]
+}

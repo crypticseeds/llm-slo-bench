@@ -86,11 +86,30 @@ type UsageSummary struct {
 	CostUSD          *float64 `json:"cost_usd"`
 }
 
+type SLOStatus string
+
+const (
+	SLOStatusPending SLOStatus = "pending"
+	SLOStatusPass    SLOStatus = "pass"
+	SLOStatusFail    SLOStatus = "fail"
+)
+
+type SLOOutcome struct {
+	Metric      string    `json:"metric"`
+	Observed    float64   `json:"observed"`
+	Operator    string    `json:"operator"`
+	Threshold   float64   `json:"threshold"`
+	SampleCount int       `json:"sample_count"`
+	Status      SLOStatus `json:"status"`
+	Pass        *bool     `json:"pass"`
+}
+
 type RunSummary struct {
 	SchemaVersion int             `json:"schema_version"`
 	Counts        Counts          `json:"counts"`
 	Metrics       MetricSummaries `json:"metrics"`
 	Usage         UsageSummary    `json:"usage"`
+	SLOOutcomes   []SLOOutcome    `json:"slo_outcomes"`
 }
 
 type Aggregator struct {
@@ -287,7 +306,8 @@ func (s *aggregateState) summary() RunSummary {
 			RequestDuration: summarize(s.requestDuration, 1000, histogramDurationUnit),
 			TokensPerSecond: summarize(s.tokensPerSecond, tokensPerSecondScale, histogramThroughputUnit),
 		},
-		Usage: usage,
+		Usage:       usage,
+		SLOOutcomes: make([]SLOOutcome, 0),
 	}
 }
 
@@ -415,6 +435,14 @@ func cloneSummary(summary RunSummary) RunSummary {
 	if summary.Usage.CostUSD != nil {
 		cost := *summary.Usage.CostUSD
 		clone.Usage.CostUSD = &cost
+	}
+	clone.SLOOutcomes = make([]SLOOutcome, len(summary.SLOOutcomes))
+	copy(clone.SLOOutcomes, summary.SLOOutcomes)
+	for i, outcome := range summary.SLOOutcomes {
+		if outcome.Pass != nil {
+			pass := *outcome.Pass
+			clone.SLOOutcomes[i].Pass = &pass
+		}
 	}
 	return clone
 }
