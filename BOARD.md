@@ -8,7 +8,7 @@ Status values: `todo`, `building`, `review`, `done`. Definitions of done are in 
 | B - Built-in mock SSE server | agent | done | ADR v1 section 08, stream B |
 | C - SSE client + semantic timing | agent | done | ADR v1 section 08, stream C; record TTFB and semantic TTFT, gate only TTFT; compression disabled |
 | D - Open-loop scheduler | agent | review | ADR v1 section 08, stream D; includes deferred mockserver `BaseContext` shutdown wiring and response-header timeout |
-| E - Metrics aggregation | agent | review | ADR v1 section 08, stream E |
+| E - Metrics aggregation | agent | done | ADR v1 section 08, stream E |
 | F - CLI + reports (Day 1 probe slice) | agent | done | ADR v1 section 08, stream F; reports remain future work |
 | G - Release + CI | agent | todo | ADR v1 section 08, stream G |
 | H - Gateway evidence | agent | todo | ADR v1 section 08, stream H |
