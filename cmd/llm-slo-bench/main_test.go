@@ -14,8 +14,10 @@ import (
 
 	"net/http/httptest"
 
+	"github.com/crypticseeds/llm-slo-bench/internal/config"
 	"github.com/crypticseeds/llm-slo-bench/internal/metrics"
 	"github.com/crypticseeds/llm-slo-bench/internal/mockserver"
+	"github.com/crypticseeds/llm-slo-bench/internal/slo"
 )
 
 func TestRunRejectsUnknownCommand(t *testing.T) {
@@ -59,8 +61,25 @@ func TestRunRampAgainstBuiltInMockProducesTTFTHistogram(t *testing.T) {
 		t.Fatalf("TTFT summary = %#v, want nonzero histogram samples", summary.Metrics.TTFT)
 	}
 	t.Logf("Day 2 gate: scheduled=%d success=%d ttft_samples=%d p99_ttft_ms=%.3f", summary.Counts.Scheduled, summary.Counts.Success, summary.Metrics.TTFT.Count, summary.Metrics.TTFT.P99)
-	if !strings.Contains(stderr.String(), "slo: pending owner evaluator") {
-		t.Fatalf("stderr = %q, want pending evaluator status", stderr.String())
+	if len(summary.SLOOutcomes) != 1 {
+		t.Fatalf("SLO outcomes = %#v, want one p99 TTFT gate", summary.SLOOutcomes)
+	}
+	outcome := summary.SLOOutcomes[0]
+	if outcome.Metric != "p99_ttft_ms" || outcome.Operator != "<=" || outcome.Threshold != 1000 ||
+		outcome.Observed != summary.Metrics.TTFT.P99 || outcome.SampleCount != int(summary.Metrics.TTFT.Count) {
+		t.Fatalf("SLO outcome = %#v, want populated p99 TTFT gate", outcome)
+	}
+	switch outcome.Status {
+	case metrics.SLOStatusPending:
+		if outcome.Pass != nil || !strings.Contains(stderr.String(), "slo: pending owner evaluator") {
+			t.Fatalf("pending SLO outcome = %#v, stderr = %q", outcome, stderr.String())
+		}
+	case metrics.SLOStatusPass:
+		if outcome.Pass == nil || !*outcome.Pass || !strings.Contains(stderr.String(), "slo: pass p99_ttft_ms") {
+			t.Fatalf("passing SLO outcome = %#v, stderr = %q", outcome, stderr.String())
+		}
+	default:
+		t.Fatalf("SLO status = %q, want pending or pass", outcome.Status)
 	}
 	raw, err := os.ReadFile(rawPath)
 	if err != nil {
@@ -108,6 +127,48 @@ func TestRunRampWritesOutAtomicallyAndLeavesRawJSONLOffByDefault(t *testing.T) {
 	}
 }
 
+func TestRunRampPersistsEvaluatedSLOOutcomesAndExitStatus(t *testing.T) {
+	server := newRampMock(t, time.Millisecond)
+	defer server.Close()
+	configPath := filepath.Join(t.TempDir(), "ramp.yaml")
+	writeRampConfig(t, configPath, server.URL+"/v1", "100ms", 40)
+
+	for _, test := range []struct {
+		name     string
+		pass     bool
+		wantCode int
+		status   metrics.SLOStatus
+	}{
+		{name: "pass", pass: true, wantCode: 0, status: metrics.SLOStatusPass},
+		{name: "fail", pass: false, wantCode: exitSLOFail, status: metrics.SLOStatusFail},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			evaluate := func(declared config.SLO, summary slo.Summary) ([]slo.Result, error) {
+				return []slo.Result{{
+					Metric: "p99_ttft_ms", Observed: *summary.P99TTFTMS, Operator: "<=",
+					Threshold: *declared.P99TTFTMS, SampleCount: summary.TTFTSamples, Pass: test.pass,
+				}}, nil
+			}
+			err := runRampWithEvaluator(context.Background(), []string{"--config", configPath}, &stdout, &stderr, evaluate)
+			if got := exitCodeOrZero(err); got != test.wantCode {
+				t.Fatalf("exit code = %d, want %d; error=%v", got, test.wantCode, err)
+			}
+			var summary metrics.RunSummary
+			if err := json.Unmarshal(stdout.Bytes(), &summary); err != nil {
+				t.Fatalf("decode summary: %v", err)
+			}
+			if len(summary.SLOOutcomes) != 1 || summary.SLOOutcomes[0].Status != test.status ||
+				summary.SLOOutcomes[0].Pass == nil || *summary.SLOOutcomes[0].Pass != test.pass {
+				t.Fatalf("SLO outcomes = %#v, want %s with pass=%t", summary.SLOOutcomes, test.status, test.pass)
+			}
+			if !strings.Contains(stderr.String(), "slo: "+string(test.status)+" p99_ttft_ms") {
+				t.Fatalf("stderr = %q, want %s gate", stderr.String(), test.status)
+			}
+		})
+	}
+}
+
 func TestRunRampCancellationReturnsInterruptAndStillEmitsSummary(t *testing.T) {
 	server := newRampMock(t, 2*time.Second)
 	defer server.Close()
@@ -131,6 +192,28 @@ func TestRunRampCancellationReturnsInterruptAndStillEmitsSummary(t *testing.T) {
 	}
 }
 
+func TestWriteSummaryMatchesVersionedGolden(t *testing.T) {
+	summary := metrics.RunSummary{
+		SchemaVersion: metrics.SchemaVersion,
+		Counts:        metrics.Counts{Scheduled: 1, Started: 1, Success: 1},
+		SLOOutcomes: []metrics.SLOOutcome{{
+			Metric: "p99_ttft_ms", Observed: 12.5, Operator: "<=", Threshold: 800,
+			SampleCount: 1, Status: metrics.SLOStatusPending,
+		}},
+	}
+	var output bytes.Buffer
+	if err := writeSummary(&output, "", summary); err != nil {
+		t.Fatal(err)
+	}
+	want, err := os.ReadFile(filepath.Join("testdata", "run-summary.golden.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(output.Bytes(), want) {
+		t.Fatalf("summary JSON does not match golden\ngot:\n%s\nwant:\n%s", output.Bytes(), want)
+	}
+}
+
 func TestExitCodeTaxonomy(t *testing.T) {
 	for name, test := range map[string]struct {
 		err  error
@@ -147,6 +230,13 @@ func TestExitCodeTaxonomy(t *testing.T) {
 			}
 		})
 	}
+}
+
+func exitCodeOrZero(err error) int {
+	if err == nil {
+		return 0
+	}
+	return exitCode(err)
 }
 
 func newRampMock(t *testing.T, firstTokenDelay time.Duration) *httptest.Server {

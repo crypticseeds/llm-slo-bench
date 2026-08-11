@@ -180,6 +180,10 @@ func runProbe(ctx context.Context, args []string) error {
 }
 
 func runRamp(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	return runRampWithEvaluator(ctx, args, stdout, stderr, slo.Evaluate)
+}
+
+func runRampWithEvaluator(ctx context.Context, args []string, stdout, stderr io.Writer, evaluate func(config.SLO, slo.Summary) ([]slo.Result, error)) error {
 	fs := flag.NewFlagSet("ramp", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	configPath := fs.String("config", "", "path to the ramp YAML config")
@@ -272,12 +276,15 @@ func runRamp(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	}
 	summary := aggregator.Close()
 
-	sloResults, sloErr := slo.Evaluate(cfg.SLO, sloSummary(summary))
+	sloResults, sloErr := evaluate(cfg.SLO, sloSummary(summary))
 	pending := evaluatorPending(cfg.SLO, sloResults, sloErr)
+	if sloErr == nil {
+		summary.SLOOutcomes = makeSLOOutcomes(cfg.SLO, sloSummary(summary), sloResults, pending)
+	}
 	if pending {
 		fmt.Fprintln(stderr, "slo: pending owner evaluator")
 	} else if sloErr == nil {
-		printSLOResults(stderr, sloResults)
+		printSLOOutcomes(stderr, summary.SLOOutcomes)
 	}
 	if err := writeSummary(stdout, *outPath, summary); err != nil {
 		processingErr = errors.Join(processingErr, err)
@@ -299,8 +306,8 @@ func runRamp(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		return executionCommandError(errors.New("run produced no usable TTFT samples"))
 	}
 	if !pending {
-		for _, result := range sloResults {
-			if !result.Pass {
+		for _, outcome := range summary.SLOOutcomes {
+			if outcome.Status == metrics.SLOStatusFail {
 				return &commandError{code: exitSLOFail, err: errors.New("one or more SLOs failed")}
 			}
 		}
@@ -393,17 +400,64 @@ func configuredSLOCount(declared config.SLO) int {
 	return count
 }
 
-func printSLOResults(writer io.Writer, results []slo.Result) {
-	if len(results) == 0 {
+func makeSLOOutcomes(declared config.SLO, observed slo.Summary, results []slo.Result, pending bool) []metrics.SLOOutcome {
+	if !pending {
+		outcomes := make([]metrics.SLOOutcome, len(results))
+		for i, result := range results {
+			pass := result.Pass
+			status := metrics.SLOStatusFail
+			if pass {
+				status = metrics.SLOStatusPass
+			}
+			outcomes[i] = metrics.SLOOutcome{
+				Metric:      result.Metric,
+				Observed:    result.Observed,
+				Operator:    result.Operator,
+				Threshold:   result.Threshold,
+				SampleCount: result.SampleCount,
+				Status:      status,
+				Pass:        &pass,
+			}
+		}
+		return outcomes
+	}
+
+	gates := []struct {
+		metric    string
+		threshold *float64
+		value     *float64
+		samples   int
+	}{
+		{metric: "p99_ttft_ms", threshold: declared.P99TTFTMS, value: observed.P99TTFTMS, samples: observed.TTFTSamples},
+		{metric: "p99_chunk_itl_ms", threshold: declared.P99ChunkITLMS, value: observed.P99ChunkITLMS, samples: observed.ChunkITLSamples},
+		{metric: "max_error_rate", threshold: declared.MaxErrorRate, value: &observed.ErrorRate, samples: observed.ScheduledRequests},
+		{metric: "max_dropped_rate", threshold: declared.MaxDroppedRate, value: &observed.DroppedRate, samples: observed.ScheduledRequests},
+		{metric: "max_cost_usd", threshold: declared.MaxCostUSD, value: observed.CostUSD, samples: observed.UsageSamples},
+	}
+	outcomes := make([]metrics.SLOOutcome, 0, len(results))
+	for _, gate := range gates {
+		if gate.threshold == nil {
+			continue
+		}
+		outcomes = append(outcomes, metrics.SLOOutcome{
+			Metric:      gate.metric,
+			Observed:    *gate.value,
+			Operator:    "<=",
+			Threshold:   *gate.threshold,
+			SampleCount: gate.samples,
+			Status:      metrics.SLOStatusPending,
+		})
+	}
+	return outcomes
+}
+
+func printSLOOutcomes(writer io.Writer, outcomes []metrics.SLOOutcome) {
+	if len(outcomes) == 0 {
 		fmt.Fprintln(writer, "slo: pass (no gates configured)")
 		return
 	}
-	for _, result := range results {
-		status := "fail"
-		if result.Pass {
-			status = "pass"
-		}
-		fmt.Fprintf(writer, "slo: %s %s observed=%g threshold=%g samples=%d\n", status, result.Metric, result.Observed, result.Threshold, result.SampleCount)
+	for _, outcome := range outcomes {
+		fmt.Fprintf(writer, "slo: %s %s observed=%g threshold=%g samples=%d\n", outcome.Status, outcome.Metric, outcome.Observed, outcome.Threshold, outcome.SampleCount)
 	}
 }
 

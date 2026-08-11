@@ -205,8 +205,15 @@ func TestAggregatorCloseReturnsFinalSummaryAndRejectsNewRecords(t *testing.T) {
 		t.Fatalf("final summary = %#v, want one success", final)
 	}
 	final.Metrics.TTFT.P99 = -1
+	pass := true
+	final.SLOOutcomes = []SLOOutcome{{Pass: &pass}}
+	closed := cloneSummary(final)
+	*closed.SLOOutcomes[0].Pass = false
 	if got := aggregator.Summary().Metrics.TTFT.P99; got < 0 {
 		t.Fatalf("closed Summary() shared mutable histogram pointer, P99 = %f", got)
+	}
+	if *final.SLOOutcomes[0].Pass != true {
+		t.Fatal("cloneSummary() shared mutable SLO pass pointer")
 	}
 	if err := aggregator.RecordDropped(); err == nil {
 		t.Fatal("RecordDropped() after Close error = nil")
