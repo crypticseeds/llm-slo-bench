@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -20,6 +19,7 @@ import (
 	"github.com/crypticseeds/llm-slo-bench/internal/metrics"
 	"github.com/crypticseeds/llm-slo-bench/internal/mockserver"
 	"github.com/crypticseeds/llm-slo-bench/internal/probe"
+	"github.com/crypticseeds/llm-slo-bench/internal/report"
 	"github.com/crypticseeds/llm-slo-bench/internal/slo"
 )
 
@@ -29,6 +29,8 @@ const (
 	exitExecution = 3
 	exitInterrupt = 130
 )
+
+var version = "dev"
 
 type commandError struct {
 	code int
@@ -47,7 +49,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return configCommandError(errors.New("usage: llm-slo-bench <mock|probe|ramp> [flags]"))
+		return configCommandError(errors.New("usage: llm-slo-bench <mock|probe|ramp|report> [flags]"))
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -61,8 +63,10 @@ func run(args []string) error {
 		err = runProbe(ctx, args[1:])
 	case "ramp":
 		err = runRamp(ctx, args[1:], os.Stdout, os.Stderr)
+	case "report":
+		err = runReport(args[1:], os.Stderr)
 	case "help", "-h", "--help":
-		fmt.Println("usage: llm-slo-bench <mock|probe|ramp> [flags]")
+		fmt.Println("usage: llm-slo-bench <mock|probe|ramp|report> [flags]")
 		return nil
 	default:
 		return configCommandError(fmt.Errorf("unknown command %q", args[0]))
@@ -188,6 +192,7 @@ func runRampWithEvaluator(ctx context.Context, args []string, stdout, stderr io.
 	fs.SetOutput(stderr)
 	configPath := fs.String("config", "", "path to the ramp YAML config")
 	outPath := fs.String("out", "", "write summary JSON atomically to this path instead of stdout")
+	htmlPath := fs.String("html", "", "write a self-contained HTML report atomically to this path")
 	rawJSONLPath := fs.String("raw-jsonl", "", "append one bounded record per started request to this path")
 	if err := fs.Parse(args); err != nil {
 		return configCommandError(err)
@@ -197,6 +202,18 @@ func runRampWithEvaluator(ctx context.Context, args []string, stdout, stderr io.
 	}
 	if fs.NArg() != 0 {
 		return configCommandError(fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " ")))
+	}
+	if err := requireDistinctPaths([]namedPath{{"--config", *configPath}, {"--out", *outPath}, {"--html", *htmlPath}, {"--raw-jsonl", *rawJSONLPath}}); err != nil {
+		return configCommandError(err)
+	}
+	if *htmlPath != "" && *rawJSONLPath != "" {
+		info, err := os.Stat(*rawJSONLPath)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return executionCommandError(fmt.Errorf("inspect request JSONL: %w", err))
+		}
+		if err == nil && info.Size() > 0 {
+			return configCommandError(errors.New("--raw-jsonl must be new or empty when --html is used so the report contains only this run"))
+		}
 	}
 
 	cfg, err := loadConfig(*configPath)
@@ -289,6 +306,20 @@ func runRampWithEvaluator(ctx context.Context, args []string, stdout, stderr io.
 	if err := writeSummary(stdout, *outPath, summary); err != nil {
 		processingErr = errors.Join(processingErr, err)
 	}
+	if *htmlPath != "" {
+		metadata := report.Metadata{
+			Scenario:    "ramp",
+			ConfigFile:  filepath.Base(*configPath),
+			Target:      cfg.Target.BaseURL,
+			Model:       cfg.Target.Model,
+			StartedAt:   loadResult.StartedAt,
+			Duration:    loadResult.FinishedAt.Sub(loadResult.StartedAt),
+			ToolVersion: version,
+		}
+		if err := writeHTML(*htmlPath, summary, report.HTMLOptions{Metadata: metadata, RequestJSONLPath: *rawJSONLPath}); err != nil {
+			processingErr = errors.Join(processingErr, err)
+		}
+	}
 
 	if errors.Is(runErr, context.Canceled) || ctx.Err() != nil {
 		return context.Canceled
@@ -313,6 +344,113 @@ func runRampWithEvaluator(ctx context.Context, args []string, stdout, stderr io.
 		}
 	}
 	return nil
+}
+
+func runReport(args []string, stderr io.Writer) error {
+	fs := flag.NewFlagSet("report", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	inputPath := fs.String("input", "", "path to an existing run summary JSON")
+	htmlPath := fs.String("html", "", "write a self-contained HTML report atomically to this path")
+	rawJSONLPath := fs.String("raw-jsonl", "", "include request records from this JSONL file")
+	if err := fs.Parse(args); err != nil {
+		return configCommandError(err)
+	}
+	if *inputPath == "" {
+		return configCommandError(errors.New("--input is required"))
+	}
+	if *htmlPath == "" {
+		return configCommandError(errors.New("--html is required"))
+	}
+	if fs.NArg() != 0 {
+		return configCommandError(fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " ")))
+	}
+	if err := requireDistinctPaths([]namedPath{{"--input", *inputPath}, {"--html", *htmlPath}, {"--raw-jsonl", *rawJSONLPath}}); err != nil {
+		return configCommandError(err)
+	}
+
+	summary, err := readSummary(*inputPath)
+	if err != nil {
+		return configCommandError(err)
+	}
+	options := report.HTMLOptions{
+		Metadata:         report.Metadata{ToolVersion: version},
+		RequestJSONLPath: *rawJSONLPath,
+	}
+	if err := writeHTML(*htmlPath, summary, options); err != nil {
+		return executionCommandError(err)
+	}
+	return nil
+}
+
+func readSummary(path string) (metrics.RunSummary, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return metrics.RunSummary{}, fmt.Errorf("open run summary: %w", err)
+	}
+	defer file.Close()
+
+	decoder := json.NewDecoder(file)
+	decoder.DisallowUnknownFields()
+	var summary metrics.RunSummary
+	if err := decoder.Decode(&summary); err != nil {
+		return metrics.RunSummary{}, fmt.Errorf("decode run summary: %w", err)
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return metrics.RunSummary{}, errors.New("decode run summary: multiple JSON values are not allowed")
+		}
+		return metrics.RunSummary{}, fmt.Errorf("decode run summary trailing data: %w", err)
+	}
+	if summary.SchemaVersion != metrics.SchemaVersion {
+		return metrics.RunSummary{}, fmt.Errorf("run summary schema_version %d is unsupported; expected %d", summary.SchemaVersion, metrics.SchemaVersion)
+	}
+	return summary, nil
+}
+
+type namedPath struct {
+	name string
+	path string
+}
+
+func requireDistinctPaths(paths []namedPath) error {
+	for left := 0; left < len(paths); left++ {
+		if paths[left].path == "" {
+			continue
+		}
+		leftPath, err := comparablePath(paths[left].path)
+		if err != nil {
+			return fmt.Errorf("resolve %s: %w", paths[left].name, err)
+		}
+		for right := left + 1; right < len(paths); right++ {
+			if paths[right].path == "" {
+				continue
+			}
+			rightPath, err := comparablePath(paths[right].path)
+			if err != nil {
+				return fmt.Errorf("resolve %s: %w", paths[right].name, err)
+			}
+			if leftPath == rightPath {
+				return fmt.Errorf("%s and %s must use different paths", paths[left].name, paths[right].name)
+			}
+		}
+	}
+	return nil
+}
+
+func comparablePath(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	if resolved, err := filepath.EvalSymlinks(absolute); err == nil {
+		return resolved, nil
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(absolute))
+	if err == nil {
+		return filepath.Join(parent, filepath.Base(absolute)), nil
+	}
+	return filepath.Clean(absolute), nil
 }
 
 func loadConfig(path string) (config.Config, error) {
@@ -462,43 +600,45 @@ func printSLOOutcomes(writer io.Writer, outcomes []metrics.SLOOutcome) {
 }
 
 func writeSummary(stdout io.Writer, path string, summary metrics.RunSummary) error {
-	var content bytes.Buffer
-	encoder := json.NewEncoder(&content)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(summary); err != nil {
-		return fmt.Errorf("encode summary JSON: %w", err)
-	}
 	if path == "" {
-		if _, err := stdout.Write(content.Bytes()); err != nil {
-			return fmt.Errorf("write summary JSON: %w", err)
-		}
-		return nil
+		return report.WriteJSON(stdout, summary)
 	}
+	return writeFileAtomically(path, "summary JSON", func(writer io.Writer) error {
+		return report.WriteJSON(writer, summary)
+	})
+}
 
+func writeHTML(path string, summary metrics.RunSummary, options report.HTMLOptions) error {
+	return writeFileAtomically(path, "HTML report", func(writer io.Writer) error {
+		return report.WriteHTML(writer, summary, options)
+	})
+}
+
+func writeFileAtomically(path, description string, write func(io.Writer) error) error {
 	directory := filepath.Dir(path)
 	temporary, err := os.CreateTemp(directory, "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
-		return fmt.Errorf("create summary temporary file: %w", err)
+		return fmt.Errorf("create %s temporary file: %w", description, err)
 	}
 	temporaryPath := temporary.Name()
 	defer os.Remove(temporaryPath)
 	if err := temporary.Chmod(0o644); err != nil {
 		temporary.Close()
-		return fmt.Errorf("set summary permissions: %w", err)
+		return fmt.Errorf("set %s permissions: %w", description, err)
 	}
-	if _, err := temporary.Write(content.Bytes()); err != nil {
+	if err := write(temporary); err != nil {
 		temporary.Close()
-		return fmt.Errorf("write summary temporary file: %w", err)
+		return err
 	}
 	if err := temporary.Sync(); err != nil {
 		temporary.Close()
-		return fmt.Errorf("sync summary temporary file: %w", err)
+		return fmt.Errorf("sync %s temporary file: %w", description, err)
 	}
 	if err := temporary.Close(); err != nil {
-		return fmt.Errorf("close summary temporary file: %w", err)
+		return fmt.Errorf("close %s temporary file: %w", description, err)
 	}
 	if err := os.Rename(temporaryPath, path); err != nil {
-		return fmt.Errorf("replace summary JSON: %w", err)
+		return fmt.Errorf("replace %s: %w", description, err)
 	}
 	return nil
 }

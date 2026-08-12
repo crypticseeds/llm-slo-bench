@@ -16,10 +16,12 @@ import (
 type Metadata struct {
 	RunID             string
 	Scenario          string
+	ConfigFile        string
 	Target            string
 	Model             string
 	StartedAt         time.Time
 	Duration          time.Duration
+	ToolVersion       string
 	ConfigFingerprint string
 }
 

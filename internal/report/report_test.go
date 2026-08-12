@@ -40,10 +40,12 @@ func TestWriteHTMLGolden(t *testing.T) {
 		Metadata: Metadata{
 			RunID:             "run-20260811-01",
 			Scenario:          "ramp",
+			ConfigFile:        "quickstart.yaml",
 			Target:            "mock.local",
 			Model:             "mock-model",
 			StartedAt:         time.Date(2026, time.August, 11, 14, 30, 0, 0, time.FixedZone("BST", 3600)),
 			Duration:          45 * time.Second,
+			ToolVersion:       "v0.1.0",
 			ConfigFingerprint: "sha256:abc123",
 		},
 		RequestJSONLPath: jsonlPath,
@@ -52,6 +54,25 @@ func TestWriteHTMLGolden(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertGolden(t, "report.golden.html", output.Bytes())
+}
+
+func TestWriteHTMLRendersWiringMetadata(t *testing.T) {
+	var output bytes.Buffer
+	err := WriteHTML(&output, metrics.RunSummary{SchemaVersion: metrics.SchemaVersion}, HTMLOptions{Metadata: Metadata{
+		ConfigFile:  "quickstart.yaml",
+		Target:      "http://127.0.0.1:8080/v1",
+		Model:       "mock-model",
+		StartedAt:   time.Date(2026, time.August, 12, 15, 4, 5, 0, time.UTC),
+		ToolVersion: "v0.1.0",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"quickstart.yaml", "http://127.0.0.1:8080/v1", "mock-model", "2026-08-12T15:04:05Z", "v0.1.0"} {
+		if !strings.Contains(output.String(), want) {
+			t.Errorf("HTML does not contain metadata value %q", want)
+		}
+	}
 }
 
 func TestWriteHTMLRendersCompleteHistogramContractAndVisualizations(t *testing.T) {

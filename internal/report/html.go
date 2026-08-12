@@ -45,10 +45,12 @@ type htmlData struct {
 type metadataView struct {
 	RunID             string
 	Scenario          string
+	ConfigFile        string
 	Target            string
 	Model             string
 	StartedAt         string
 	Duration          string
+	ToolVersion       string
 	ConfigFingerprint string
 }
 
@@ -564,10 +566,12 @@ func metadataFor(metadata Metadata) metadataView {
 	return metadataView{
 		RunID:             valueOrNotProvided(metadata.RunID),
 		Scenario:          valueOrNotProvided(metadata.Scenario),
+		ConfigFile:        valueOrNotProvided(metadata.ConfigFile),
 		Target:            valueOrNotProvided(metadata.Target),
 		Model:             valueOrNotProvided(metadata.Model),
 		StartedAt:         startedAt,
 		Duration:          duration,
+		ToolVersion:       valueOrNotProvided(metadata.ToolVersion),
 		ConfigFingerprint: valueOrNotProvided(metadata.ConfigFingerprint),
 	}
 }
