@@ -40,10 +40,12 @@ func TestWriteHTMLGolden(t *testing.T) {
 		Metadata: Metadata{
 			RunID:             "run-20260811-01",
 			Scenario:          "ramp",
+			ConfigFile:        "quickstart.yaml",
 			Target:            "mock.local",
 			Model:             "mock-model",
 			StartedAt:         time.Date(2026, time.August, 11, 14, 30, 0, 0, time.FixedZone("BST", 3600)),
 			Duration:          45 * time.Second,
+			ToolVersion:       "v0.1.0",
 			ConfigFingerprint: "sha256:abc123",
 		},
 		RequestJSONLPath: jsonlPath,
@@ -52,6 +54,25 @@ func TestWriteHTMLGolden(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertGolden(t, "report.golden.html", output.Bytes())
+}
+
+func TestWriteHTMLRendersWiringMetadata(t *testing.T) {
+	var output bytes.Buffer
+	err := WriteHTML(&output, metrics.RunSummary{SchemaVersion: metrics.SchemaVersion}, HTMLOptions{Metadata: Metadata{
+		ConfigFile:  "quickstart.yaml",
+		Target:      "http://127.0.0.1:8080/v1",
+		Model:       "mock-model",
+		StartedAt:   time.Date(2026, time.August, 12, 15, 4, 5, 0, time.UTC),
+		ToolVersion: "v0.1.0",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"quickstart.yaml", "http://127.0.0.1:8080/v1", "mock-model", "2026-08-12T15:04:05Z", "v0.1.0"} {
+		if !strings.Contains(output.String(), want) {
+			t.Errorf("HTML does not contain metadata value %q", want)
+		}
+	}
 }
 
 func TestWriteHTMLRendersCompleteHistogramContractAndVisualizations(t *testing.T) {
@@ -69,6 +90,9 @@ func TestWriteHTMLRendersCompleteHistogramContractAndVisualizations(t *testing.T
 		`LATENCY DISTRIBUTIONS`,
 		`uPlot license · MIT`,
 		`Canceled`,
+		`<td data-label="Status" class="pass">pass</td>`,
+		`<td data-label="Status" class="fail">fail</td>`,
+		`<td data-label="Result" class="pending">pending</td>`,
 	} {
 		if !strings.Contains(report, want) {
 			t.Errorf("HTML does not contain %q", want)
@@ -473,7 +497,16 @@ func fixtureSummary() metrics.RunSummary {
 			Samples: 4, Complete: false, PromptTokens: 320, CompletionTokens: 80,
 			TotalTokens: 400, CostUSD: &cost,
 		},
+		SLOOutcomes: []metrics.SLOOutcome{
+			{Metric: "p99_ttft_ms", Observed: 40, Operator: "<=", Threshold: 800, SampleCount: 5, Status: metrics.SLOStatusPass, Pass: boolPointer(true)},
+			{Metric: "max_error_rate", Observed: 0.3, Operator: "<=", Threshold: 0.1, SampleCount: 10, Status: metrics.SLOStatusFail, Pass: boolPointer(false)},
+			{Metric: "max_cost_usd", Observed: cost, Operator: "<=", Threshold: 0.01, SampleCount: 4, Status: metrics.SLOStatusPending},
+		},
 	}
+}
+
+func boolPointer(value bool) *bool {
+	return &value
 }
 
 func histogram(count int64, min, max, mean, p50, p90, p95, p99 float64) *metrics.HistogramSummary {

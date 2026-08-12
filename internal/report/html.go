@@ -26,6 +26,7 @@ type htmlData struct {
 	Metadata      metadataView
 	Metrics       []metricView
 	Outcomes      []outcomeView
+	SLOOutcomes   []sloOutcomeView
 	UsageState    string
 	UsageNote     string
 	Cost          string
@@ -45,10 +46,12 @@ type htmlData struct {
 type metadataView struct {
 	RunID             string
 	Scenario          string
+	ConfigFile        string
 	Target            string
 	Model             string
 	StartedAt         string
 	Duration          string
+	ToolVersion       string
 	ConfigFingerprint string
 }
 
@@ -72,6 +75,15 @@ type outcomeView struct {
 	Percentage string
 	Width      string
 	Class      string
+}
+
+type sloOutcomeView struct {
+	Metric      string
+	Threshold   string
+	Observed    string
+	SampleCount int
+	Status      string
+	Result      string
 }
 
 type ttftStripView struct {
@@ -197,10 +209,15 @@ func newHTMLData(summary metrics.RunSummary, options HTMLOptions, snapshot *requ
 		newMetricView("Request duration", summary.Metrics.RequestDuration),
 		newMetricView("Tokens per second", summary.Metrics.TokensPerSecond),
 	}
+	sloOutcomes := make([]sloOutcomeView, len(summary.SLOOutcomes))
+	for index, outcome := range summary.SLOOutcomes {
+		sloOutcomes[index] = newSLOOutcomeView(outcome)
+	}
 	data := htmlData{
-		Summary:  summary,
-		Metadata: metadataFor(options.Metadata),
-		Metrics:  metricsViews,
+		Summary:     summary,
+		Metadata:    metadataFor(options.Metadata),
+		Metrics:     metricsViews,
+		SLOOutcomes: sloOutcomes,
 		Outcomes: []outcomeView{
 			newOutcomeView("Success", summary.Counts.Success, summary.Counts.Scheduled, "success"),
 			newOutcomeView("Dropped", summary.Counts.Dropped, summary.Counts.Scheduled, "dropped"),
@@ -227,6 +244,29 @@ func newHTMLData(summary metrics.RunSummary, options HTMLOptions, snapshot *requ
 		data.TTFTStrip = newTTFTStripView(snapshot.ttft, snapshot.count)
 	}
 	return data
+}
+
+func newSLOOutcomeView(outcome metrics.SLOOutcome) sloOutcomeView {
+	result := "pending"
+	if outcome.Pass != nil {
+		if *outcome.Pass {
+			result = "pass"
+		} else {
+			result = "fail"
+		}
+	}
+	return sloOutcomeView{
+		Metric:      outcome.Metric,
+		Threshold:   outcome.Operator + " " + formatSLOValue(outcome.Threshold),
+		Observed:    formatSLOValue(outcome.Observed),
+		SampleCount: outcome.SampleCount,
+		Status:      string(outcome.Status),
+		Result:      result,
+	}
+}
+
+func formatSLOValue(value float64) string {
+	return strconv.FormatFloat(value, 'f', -1, 64)
 }
 
 func newMetricView(name string, summary *metrics.HistogramSummary) metricView {
@@ -564,10 +604,12 @@ func metadataFor(metadata Metadata) metadataView {
 	return metadataView{
 		RunID:             valueOrNotProvided(metadata.RunID),
 		Scenario:          valueOrNotProvided(metadata.Scenario),
+		ConfigFile:        valueOrNotProvided(metadata.ConfigFile),
 		Target:            valueOrNotProvided(metadata.Target),
 		Model:             valueOrNotProvided(metadata.Model),
 		StartedAt:         startedAt,
 		Duration:          duration,
+		ToolVersion:       valueOrNotProvided(metadata.ToolVersion),
 		ConfigFingerprint: valueOrNotProvided(metadata.ConfigFingerprint),
 	}
 }

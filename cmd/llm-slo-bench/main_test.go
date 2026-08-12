@@ -6,8 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
+	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -37,6 +40,25 @@ func TestRunMockRejectsUnknownProfile(t *testing.T) {
 func TestRunHelpIsSuccessful(t *testing.T) {
 	if err := run([]string{"probe", "--help"}); err != nil {
 		t.Fatalf("run(probe --help) error = %v", err)
+	}
+}
+
+func TestQuickstartConfigLoadsStrictly(t *testing.T) {
+	path := filepath.Join("..", "..", "examples", "quickstart.yaml")
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	cfg, err := config.LoadReader(file)
+	if err != nil {
+		t.Fatalf("config.LoadReader(%s) error = %v", path, err)
+	}
+	if cfg.Target.BaseURL != "http://127.0.0.1:8080/v1" || cfg.Target.APIKeyEnv != "" || len(cfg.Load.Stages) != 2 {
+		t.Fatalf("quickstart config = %#v, want loopback mock target with two stages and no API key", cfg)
+	}
+	if cfg.SLO.P99TTFTMS == nil || cfg.SLO.MaxCostUSD == nil {
+		t.Fatalf("quickstart SLO = %#v, want TTFT and cost gates", cfg.SLO)
 	}
 }
 
@@ -123,6 +145,183 @@ func TestRunRampWritesOutAtomicallyAndLeavesRawJSONLOffByDefault(t *testing.T) {
 	for _, entry := range entries {
 		if strings.Contains(entry.Name(), ".summary.json.tmp-") || strings.HasSuffix(entry.Name(), ".jsonl") {
 			t.Fatalf("unexpected output artifact %q", entry.Name())
+		}
+	}
+}
+
+func TestRunRampWritesHTMLWithRunMetadata(t *testing.T) {
+	server := newRampMock(t, time.Millisecond)
+	defer server.Close()
+	directory := t.TempDir()
+	configPath := filepath.Join(directory, "ramp.yaml")
+	htmlPath := filepath.Join(directory, "report.html")
+	writeRampConfig(t, configPath, server.URL+"/v1", "100ms", 40)
+
+	var stdout, stderr bytes.Buffer
+	if err := runRamp(context.Background(), []string{"--config", configPath, "--html", htmlPath}, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	decoder := json.NewDecoder(&stdout)
+	var summary metrics.RunSummary
+	if err := decoder.Decode(&summary); err != nil {
+		t.Fatalf("decode stdout summary: %v\nstdout:\n%s", err, stdout.String())
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		t.Fatalf("stdout contains more than one RunSummary: %v\nstdout:\n%s", err, stdout.String())
+	}
+	if len(summary.SLOOutcomes) == 0 {
+		t.Fatal("stdout summary has no SLO outcomes")
+	}
+	content, err := os.ReadFile(htmlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`<span class="label">Scenario</span><span class="value">ramp</span>`,
+		`<span class="label">Config file</span><span class="value"><code>ramp.yaml</code></span>`,
+		`<span class="label">Target</span><span class="value">` + server.URL + `/v1</span>`,
+		`<span class="label">Model</span><span class="value">mock-model</span>`,
+		`<span class="label">Started</span><span class="value">20`,
+		`<span class="label">Tool version</span><span class="value">dev</span>`,
+	} {
+		if !bytes.Contains(content, []byte(want)) {
+			t.Errorf("HTML does not contain %q", want)
+		}
+	}
+	for _, outcome := range summary.SLOOutcomes {
+		result := "pending"
+		if outcome.Pass != nil && *outcome.Pass {
+			result = "pass"
+		} else if outcome.Pass != nil {
+			result = "fail"
+		}
+		want := fmt.Sprintf(`<tr><td data-label="Metric">%s</td><td data-label="Threshold">%s %s</td><td data-label="Observed">%s</td><td data-label="Samples">%d</td><td data-label="Status" class="%s">%s</td><td data-label="Result" class="%s">%s</td></tr>`,
+			html.EscapeString(outcome.Metric), html.EscapeString(outcome.Operator), strconv.FormatFloat(outcome.Threshold, 'f', -1, 64), strconv.FormatFloat(outcome.Observed, 'f', -1, 64), outcome.SampleCount,
+			outcome.Status, outcome.Status, result, result)
+		if !bytes.Contains(content, []byte(want)) {
+			t.Errorf("HTML does not reflect stdout SLO outcome %#v", outcome)
+		}
+	}
+	if bytes.Contains(content, []byte("SLO evaluation is not attached")) {
+		t.Fatal("HTML reports missing SLO evaluation despite stdout outcomes")
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), ".report.html.tmp-") {
+			t.Fatalf("atomic HTML write left temporary file %q", entry.Name())
+		}
+	}
+}
+
+func TestRunRampRejectsAliasedOutputPaths(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "artifact")
+	err := runRamp(context.Background(), []string{"--config", "unused.yaml", "--out", path, "--html", path}, io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "--out and --html must use different paths") || exitCode(err) != exitConfig {
+		t.Fatalf("runRamp() error = %v, want aliased output config error", err)
+	}
+}
+
+func TestRunRampRejectsExistingRawJSONLForHTML(t *testing.T) {
+	directory := t.TempDir()
+	rawPath := filepath.Join(directory, "requests.jsonl")
+	if err := os.WriteFile(rawPath, []byte("existing\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := runRamp(context.Background(), []string{
+		"--config", "unused.yaml",
+		"--html", filepath.Join(directory, "report.html"),
+		"--raw-jsonl", rawPath,
+	}, io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "must be new or empty") || exitCode(err) != exitConfig {
+		t.Fatalf("runRamp() error = %v, want existing raw JSONL config error", err)
+	}
+}
+
+func TestRunReportRendersExistingSummaryWithOptionalRawJSONL(t *testing.T) {
+	directory := t.TempDir()
+	inputPath := filepath.Join(directory, "summary.json")
+	htmlPath := filepath.Join(directory, "report.html")
+	rawPath := filepath.Join(directory, "requests.jsonl")
+	summary := metrics.RunSummary{SchemaVersion: metrics.SchemaVersion, Counts: metrics.Counts{Scheduled: 1, Started: 1, Success: 1}}
+	if err := writeSummary(io.Discard, inputPath, summary); err != nil {
+		t.Fatal(err)
+	}
+	writeValidRequestJSONL(t, rawPath)
+
+	var stderr bytes.Buffer
+	if err := runReport([]string{"--input", inputPath, "--html", htmlPath, "--raw-jsonl", rawPath}, &stderr); err != nil {
+		t.Fatalf("runReport() error = %v\nstderr:\n%s", err, stderr.String())
+	}
+	content, err := os.ReadFile(htmlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"REQUEST RECORDS", "requests.jsonl", "Tool version", "dev"} {
+		if !bytes.Contains(content, []byte(want)) {
+			t.Errorf("HTML does not contain %q", want)
+		}
+	}
+}
+
+func TestRunReportRequiresInputAndHTMLFlags(t *testing.T) {
+	for name, args := range map[string][]string{
+		"input": {"--html", "report.html"},
+		"html":  {"--input", "summary.json"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := runReport(args, io.Discard)
+			if err == nil || !strings.Contains(err.Error(), "--"+name+" is required") || exitCode(err) != exitConfig {
+				t.Fatalf("runReport() error = %v, want missing --%s config error", err, name)
+			}
+		})
+	}
+}
+
+func TestRunReportRejectsInputOutputPathCollision(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "summary.json")
+	err := runReport([]string{"--input", path, "--html", path}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "--input and --html must use different paths") || exitCode(err) != exitConfig {
+		t.Fatalf("runReport() error = %v, want input/output collision config error", err)
+	}
+}
+
+func TestRunReportLeavesExistingHTMLUntouchedOnRenderFailure(t *testing.T) {
+	directory := t.TempDir()
+	inputPath := filepath.Join(directory, "summary.json")
+	htmlPath := filepath.Join(directory, "report.html")
+	rawPath := filepath.Join(directory, "invalid.jsonl")
+	if err := writeSummary(io.Discard, inputPath, metrics.RunSummary{SchemaVersion: metrics.SchemaVersion}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(htmlPath, []byte("existing report"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(rawPath, []byte("{not-json}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := runReport([]string{"--input", inputPath, "--html", htmlPath, "--raw-jsonl", rawPath}, io.Discard)
+	if err == nil || exitCode(err) != exitExecution {
+		t.Fatalf("runReport() error = %v, want execution error", err)
+	}
+	content, readErr := os.ReadFile(htmlPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(content) != "existing report" {
+		t.Fatalf("HTML after failed atomic write = %q, want existing content", content)
+	}
+	entries, readErr := os.ReadDir(directory)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), ".report.html.tmp-") {
+			t.Fatalf("failed atomic HTML write left temporary file %q", entry.Name())
 		}
 	}
 }
@@ -285,6 +484,14 @@ pricing:
 output: {}
 `, baseURL, duration, targetRPS)
 	if err := os.WriteFile(path, []byte(configYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeValidRequestJSONL(t *testing.T, path string) {
+	t.Helper()
+	line := `{"schema_version":1,"outcome":"success","status_code":200,"ttfb_micros":2500,"ttft_micros":12500,"chunk_itl_micros":[3000,4000],"duration_micros":112500,"usage_status":"available","usage":{"prompt_tokens":8,"completion_tokens":2,"total_tokens":10}}` + "\n"
+	if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
 		t.Fatal(err)
 	}
 }

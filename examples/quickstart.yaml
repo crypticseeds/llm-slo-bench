@@ -1,0 +1,51 @@
+# llm-slo-bench quickstart for the built-in mock server.
+# Start the mock with: ./bin/llm-slo-bench mock --profile fast
+version: 1
+
+target:
+  # ramp appends /chat/completions to this OpenAI-compatible base URL.
+  base_url: http://127.0.0.1:8080/v1
+  model: mock-model
+  # Loopback targets intentionally need no api_key_env.
+
+request:
+  # Keep the prompt and completion bound small for a quick local run.
+  prompt: Explain why p99 latency matters in one sentence.
+  max_completion_tokens: 16
+  timeout: 5s
+  stream_idle_timeout: 2s
+
+load:
+  # At most four requests may be active at once.
+  max_in_flight: 4
+  stages:
+    # Warm up from zero to four requests per second.
+    - duration: 1s
+      target_rps: 4
+    # Briefly ramp to eight requests per second.
+    - duration: 1s
+      target_rps: 8
+
+slo:
+  # The fast mock normally emits its first token after about 10 ms.
+  p99_ttft_ms: 250
+  # Mock token pricing below is zero, so this remains a deterministic gate.
+  max_cost_usd: 0.01
+
+safety:
+  # These hard caps bound local runtime, request volume, and reserved spend.
+  max_requests: 20
+  max_duration: 5s
+  max_cost_usd: 0.10
+  reserve_cost_per_request_usd: 0.001
+
+pricing:
+  # The built-in mock incurs no provider cost.
+  input_usd_per_million_tokens: 0
+  output_usd_per_million_tokens: 0
+
+output:
+  # CLI flags select artifact paths in the quickstart demo.
+  json: ""
+  html: ""
+  raw_jsonl: ""
