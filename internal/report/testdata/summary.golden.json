@@ -214,5 +214,33 @@
     "total_tokens": 400,
     "cost_usd": 0.000042
   },
-  "slo_outcomes": null
+  "slo_outcomes": [
+    {
+      "metric": "p99_ttft_ms",
+      "observed": 40,
+      "operator": "\u003c=",
+      "threshold": 800,
+      "sample_count": 5,
+      "status": "pass",
+      "pass": true
+    },
+    {
+      "metric": "max_error_rate",
+      "observed": 0.3,
+      "operator": "\u003c=",
+      "threshold": 0.1,
+      "sample_count": 10,
+      "status": "fail",
+      "pass": false
+    },
+    {
+      "metric": "max_cost_usd",
+      "observed": 0.000042,
+      "operator": "\u003c=",
+      "threshold": 0.01,
+      "sample_count": 4,
+      "status": "pending",
+      "pass": null
+    }
+  ]
 }

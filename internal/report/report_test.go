@@ -90,6 +90,9 @@ func TestWriteHTMLRendersCompleteHistogramContractAndVisualizations(t *testing.T
 		`LATENCY DISTRIBUTIONS`,
 		`uPlot license · MIT`,
 		`Canceled`,
+		`<td data-label="Status" class="pass">pass</td>`,
+		`<td data-label="Status" class="fail">fail</td>`,
+		`<td data-label="Result" class="pending">pending</td>`,
 	} {
 		if !strings.Contains(report, want) {
 			t.Errorf("HTML does not contain %q", want)
@@ -494,7 +497,16 @@ func fixtureSummary() metrics.RunSummary {
 			Samples: 4, Complete: false, PromptTokens: 320, CompletionTokens: 80,
 			TotalTokens: 400, CostUSD: &cost,
 		},
+		SLOOutcomes: []metrics.SLOOutcome{
+			{Metric: "p99_ttft_ms", Observed: 40, Operator: "<=", Threshold: 800, SampleCount: 5, Status: metrics.SLOStatusPass, Pass: boolPointer(true)},
+			{Metric: "max_error_rate", Observed: 0.3, Operator: "<=", Threshold: 0.1, SampleCount: 10, Status: metrics.SLOStatusFail, Pass: boolPointer(false)},
+			{Metric: "max_cost_usd", Observed: cost, Operator: "<=", Threshold: 0.01, SampleCount: 4, Status: metrics.SLOStatusPending},
+		},
 	}
+}
+
+func boolPointer(value bool) *bool {
+	return &value
 }
 
 func histogram(count int64, min, max, mean, p50, p90, p95, p99 float64) *metrics.HistogramSummary {

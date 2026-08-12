@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -159,6 +161,18 @@ func TestRunRampWritesHTMLWithRunMetadata(t *testing.T) {
 	if err := runRamp(context.Background(), []string{"--config", configPath, "--html", htmlPath}, &stdout, &stderr); err != nil {
 		t.Fatal(err)
 	}
+	decoder := json.NewDecoder(&stdout)
+	var summary metrics.RunSummary
+	if err := decoder.Decode(&summary); err != nil {
+		t.Fatalf("decode stdout summary: %v\nstdout:\n%s", err, stdout.String())
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		t.Fatalf("stdout contains more than one RunSummary: %v\nstdout:\n%s", err, stdout.String())
+	}
+	if len(summary.SLOOutcomes) == 0 {
+		t.Fatal("stdout summary has no SLO outcomes")
+	}
 	content, err := os.ReadFile(htmlPath)
 	if err != nil {
 		t.Fatal(err)
@@ -174,6 +188,23 @@ func TestRunRampWritesHTMLWithRunMetadata(t *testing.T) {
 		if !bytes.Contains(content, []byte(want)) {
 			t.Errorf("HTML does not contain %q", want)
 		}
+	}
+	for _, outcome := range summary.SLOOutcomes {
+		result := "pending"
+		if outcome.Pass != nil && *outcome.Pass {
+			result = "pass"
+		} else if outcome.Pass != nil {
+			result = "fail"
+		}
+		want := fmt.Sprintf(`<tr><td data-label="Metric">%s</td><td data-label="Threshold">%s %s</td><td data-label="Observed">%s</td><td data-label="Samples">%d</td><td data-label="Status" class="%s">%s</td><td data-label="Result" class="%s">%s</td></tr>`,
+			html.EscapeString(outcome.Metric), html.EscapeString(outcome.Operator), strconv.FormatFloat(outcome.Threshold, 'f', -1, 64), strconv.FormatFloat(outcome.Observed, 'f', -1, 64), outcome.SampleCount,
+			outcome.Status, outcome.Status, result, result)
+		if !bytes.Contains(content, []byte(want)) {
+			t.Errorf("HTML does not reflect stdout SLO outcome %#v", outcome)
+		}
+	}
+	if bytes.Contains(content, []byte("SLO evaluation is not attached")) {
+		t.Fatal("HTML reports missing SLO evaluation despite stdout outcomes")
 	}
 	entries, err := os.ReadDir(directory)
 	if err != nil {
