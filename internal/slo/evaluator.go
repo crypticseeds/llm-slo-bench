@@ -2,6 +2,7 @@ package slo
 
 import (
 	"fmt"
+	"math"
 
 	"github.com/crypticseeds/llm-slo-bench/internal/config"
 )
@@ -72,6 +73,21 @@ func Evaluate(declared config.SLO, summary Summary) ([]Result, error) {
 // Examples: ("p99_ttft_ms", 799, 800) passes; ("p99_ttft_ms", 801, 800)
 // fails; ("p99_ttft_ms", 800, 800) passes.
 func ComparePercentile(metric string, observed, threshold float64) (Result, error) {
-	// TODO(Femi): implement the contract above as a pure comparison function.
-	return Result{}, nil
+	if metric == "" {
+		return Result{}, fmt.Errorf("metric must not be empty")
+	}
+	if math.IsNaN(observed) || math.IsInf(observed, 0) || observed < 0 {
+		return Result{}, fmt.Errorf("observed value for %s must be finite and non-negative", metric)
+	}
+	if math.IsNaN(threshold) || math.IsInf(threshold, 0) || threshold < 0 {
+		return Result{}, fmt.Errorf("threshold for %s must be finite and non-negative", metric)
+	}
+
+	return Result{
+		Metric:    metric,
+		Observed:  observed,
+		Operator:  "<=",
+		Threshold: threshold,
+		Pass:      observed <= threshold,
+	}, nil
 }
