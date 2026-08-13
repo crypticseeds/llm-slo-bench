@@ -23,6 +23,7 @@ const (
 	tokensPerSecondScale    = 1000
 	histogramDurationUnit   = "ms"
 	histogramThroughputUnit = "tokens_per_second"
+	distributionPointCap    = 100
 )
 
 type Outcome string
@@ -55,18 +56,24 @@ type Counts struct {
 }
 
 type HistogramSummary struct {
-	Count              int64   `json:"count"`
-	Min                float64 `json:"min"`
-	Max                float64 `json:"max"`
-	Mean               float64 `json:"mean"`
-	P50                float64 `json:"p50"`
-	P90                float64 `json:"p90"`
-	P95                float64 `json:"p95"`
-	P99                float64 `json:"p99"`
-	LowestTrackable    float64 `json:"lowest_trackable"`
-	HighestTrackable   float64 `json:"highest_trackable"`
-	SignificantFigures int     `json:"significant_figures"`
-	Unit               string  `json:"unit"`
+	Count              int64               `json:"count"`
+	Min                float64             `json:"min"`
+	Max                float64             `json:"max"`
+	Mean               float64             `json:"mean"`
+	P50                float64             `json:"p50"`
+	P90                float64             `json:"p90"`
+	P95                float64             `json:"p95"`
+	P99                float64             `json:"p99"`
+	LowestTrackable    float64             `json:"lowest_trackable"`
+	HighestTrackable   float64             `json:"highest_trackable"`
+	SignificantFigures int                 `json:"significant_figures"`
+	Unit               string              `json:"unit"`
+	Distribution       []DistributionPoint `json:"distribution"`
+}
+
+type DistributionPoint struct {
+	Percentile float64 `json:"percentile"`
+	Value      float64 `json:"value"`
 }
 
 type MetricSummaries struct {
@@ -86,11 +93,30 @@ type UsageSummary struct {
 	CostUSD          *float64 `json:"cost_usd"`
 }
 
+type SLOStatus string
+
+const (
+	SLOStatusPending SLOStatus = "pending"
+	SLOStatusPass    SLOStatus = "pass"
+	SLOStatusFail    SLOStatus = "fail"
+)
+
+type SLOOutcome struct {
+	Metric      string    `json:"metric"`
+	Observed    float64   `json:"observed"`
+	Operator    string    `json:"operator"`
+	Threshold   float64   `json:"threshold"`
+	SampleCount int       `json:"sample_count"`
+	Status      SLOStatus `json:"status"`
+	Pass        *bool     `json:"pass"`
+}
+
 type RunSummary struct {
 	SchemaVersion int             `json:"schema_version"`
 	Counts        Counts          `json:"counts"`
 	Metrics       MetricSummaries `json:"metrics"`
 	Usage         UsageSummary    `json:"usage"`
+	SLOOutcomes   []SLOOutcome    `json:"slo_outcomes"`
 }
 
 type Aggregator struct {
@@ -287,7 +313,8 @@ func (s *aggregateState) summary() RunSummary {
 			RequestDuration: summarize(s.requestDuration, 1000, histogramDurationUnit),
 			TokensPerSecond: summarize(s.tokensPerSecond, tokensPerSecondScale, histogramThroughputUnit),
 		},
-		Usage: usage,
+		Usage:       usage,
+		SLOOutcomes: make([]SLOOutcome, 0),
 	}
 }
 
@@ -397,7 +424,37 @@ func summarize(histogram *hdrhistogram.Histogram, scale float64, unit string) *H
 		HighestTrackable:   float64(HighestTrackableMicros) / scale,
 		SignificantFigures: SignificantFigures,
 		Unit:               unit,
+		Distribution:       distributionFor(histogram, scale),
 	}
+}
+
+func distributionFor(histogram *hdrhistogram.Histogram, scale float64) []DistributionPoint {
+	brackets := histogram.CumulativeDistribution()
+	if len(brackets) == 0 {
+		return nil
+	}
+	if len(brackets) == 1 {
+		value := float64(brackets[0].ValueAt) / scale
+		return []DistributionPoint{{Percentile: 0, Value: value}, {Percentile: 100, Value: value}}
+	}
+	step := 1
+	if len(brackets) > distributionPointCap {
+		step = (len(brackets) - 1 + distributionPointCap - 2) / (distributionPointCap - 1)
+	}
+	points := make([]DistributionPoint, 0, min(len(brackets), distributionPointCap))
+	for index := 0; index < len(brackets); index += step {
+		bracket := brackets[index]
+		points = append(points, DistributionPoint{Percentile: bracket.Quantile, Value: float64(bracket.ValueAt) / scale})
+	}
+	last := brackets[len(brackets)-1]
+	if points[len(points)-1].Percentile != last.Quantile || points[len(points)-1].Value != float64(last.ValueAt)/scale {
+		if len(points) == distributionPointCap {
+			points[len(points)-1] = DistributionPoint{Percentile: last.Quantile, Value: float64(last.ValueAt) / scale}
+		} else {
+			points = append(points, DistributionPoint{Percentile: last.Quantile, Value: float64(last.ValueAt) / scale})
+		}
+	}
+	return points
 }
 
 func tokenCost(usage *probe.Usage, pricing Pricing) float64 {
@@ -416,6 +473,14 @@ func cloneSummary(summary RunSummary) RunSummary {
 		cost := *summary.Usage.CostUSD
 		clone.Usage.CostUSD = &cost
 	}
+	clone.SLOOutcomes = make([]SLOOutcome, len(summary.SLOOutcomes))
+	copy(clone.SLOOutcomes, summary.SLOOutcomes)
+	for i, outcome := range summary.SLOOutcomes {
+		if outcome.Pass != nil {
+			pass := *outcome.Pass
+			clone.SLOOutcomes[i].Pass = &pass
+		}
+	}
 	return clone
 }
 
@@ -424,6 +489,7 @@ func cloneHistogramSummary(summary *HistogramSummary) *HistogramSummary {
 		return nil
 	}
 	clone := *summary
+	clone.Distribution = append([]DistributionPoint(nil), summary.Distribution...)
 	return &clone
 }
 

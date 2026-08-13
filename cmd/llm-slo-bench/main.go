@@ -6,25 +6,50 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/crypticseeds/llm-slo-bench/internal/config"
+	"github.com/crypticseeds/llm-slo-bench/internal/loadgen"
+	"github.com/crypticseeds/llm-slo-bench/internal/metrics"
 	"github.com/crypticseeds/llm-slo-bench/internal/mockserver"
 	"github.com/crypticseeds/llm-slo-bench/internal/probe"
+	"github.com/crypticseeds/llm-slo-bench/internal/report"
+	"github.com/crypticseeds/llm-slo-bench/internal/slo"
 )
+
+const (
+	exitSLOFail   = 1
+	exitConfig    = 2
+	exitExecution = 3
+	exitInterrupt = 130
+)
+
+var version = "dev"
+
+type commandError struct {
+	code int
+	err  error
+}
+
+func (e *commandError) Error() string { return e.err.Error() }
+func (e *commandError) Unwrap() error { return e.err }
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
-		os.Exit(1)
+		os.Exit(exitCode(err))
 	}
 }
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: llm-slo-bench <mock|probe> [flags]")
+		return configCommandError(errors.New("usage: llm-slo-bench <mock|probe|ramp|report> [flags]"))
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -36,14 +61,21 @@ func run(args []string) error {
 		err = runMock(ctx, args[1:])
 	case "probe":
 		err = runProbe(ctx, args[1:])
+	case "ramp":
+		err = runRamp(ctx, args[1:], os.Stdout, os.Stderr)
+	case "report":
+		err = runReport(args[1:], os.Stderr)
 	case "help", "-h", "--help":
-		fmt.Println("usage: llm-slo-bench <mock|probe> [flags]")
+		fmt.Println("usage: llm-slo-bench <mock|probe|ramp|report> [flags]")
 		return nil
 	default:
-		return fmt.Errorf("unknown command %q", args[0])
+		return configCommandError(fmt.Errorf("unknown command %q", args[0]))
 	}
 	if errors.Is(err, flag.ErrHelp) {
 		return nil
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 	return err
 }
@@ -60,12 +92,12 @@ func runMock(ctx context.Context, args []string) error {
 	faultAfter := fs.Int("fault-after", 1, "content event after which a stream fault occurs")
 	stallDuration := fs.Duration("stall-duration", 30*time.Second, "duration of the stall fault")
 	if err := fs.Parse(args); err != nil {
-		return err
+		return configCommandError(err)
 	}
 
 	profile, err := mockserver.LookupProfile(*profileName)
 	if err != nil {
-		return err
+		return configCommandError(err)
 	}
 	if *firstTokenDelay >= 0 {
 		profile.FirstTokenDelay = *firstTokenDelay
@@ -84,11 +116,14 @@ func runMock(ctx context.Context, args []string) error {
 		StallDuration: *stallDuration,
 	}
 	if err := cfg.Validate(); err != nil {
-		return err
+		return configCommandError(err)
 	}
 
 	fmt.Printf("mock listening on http://%s/v1/chat/completions (profile=%s, first_token=%s, chunk=%s)\n", cfg.Address, profile.Name, profile.FirstTokenDelay, profile.ChunkDelay)
-	return mockserver.Serve(ctx, cfg)
+	if err := mockserver.Serve(ctx, cfg); err != nil {
+		return executionCommandError(err)
+	}
+	return nil
 }
 
 func runProbe(ctx context.Context, args []string) error {
@@ -101,14 +136,14 @@ func runProbe(ctx context.Context, args []string) error {
 	idleTimeout := fs.Duration("stream-idle-timeout", 5*time.Second, "maximum time without an SSE event")
 	apiKeyEnv := fs.String("api-key-env", "", "environment variable containing the API key")
 	if err := fs.Parse(args); err != nil {
-		return err
+		return configCommandError(err)
 	}
 
 	var apiKey string
 	if *apiKeyEnv != "" {
 		apiKey = os.Getenv(*apiKeyEnv)
 		if apiKey == "" {
-			return fmt.Errorf("environment variable %s is empty", *apiKeyEnv)
+			return configCommandError(fmt.Errorf("environment variable %s is empty", *apiKeyEnv))
 		}
 	}
 
@@ -122,7 +157,7 @@ func runProbe(ctx context.Context, args []string) error {
 		StreamIdleTimeout:   *idleTimeout,
 	})
 	if err != nil {
-		return err
+		return executionCommandError(err)
 	}
 
 	out := struct {
@@ -146,6 +181,485 @@ func runProbe(ctx context.Context, args []string) error {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(out)
+}
+
+func runRamp(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	return runRampWithEvaluator(ctx, args, stdout, stderr, slo.Evaluate)
+}
+
+func runRampWithEvaluator(ctx context.Context, args []string, stdout, stderr io.Writer, evaluate func(config.SLO, slo.Summary) ([]slo.Result, error)) error {
+	fs := flag.NewFlagSet("ramp", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	configPath := fs.String("config", "", "path to the ramp YAML config")
+	outPath := fs.String("out", "", "write summary JSON atomically to this path instead of stdout")
+	htmlPath := fs.String("html", "", "write a self-contained HTML report atomically to this path")
+	rawJSONLPath := fs.String("raw-jsonl", "", "append one bounded record per started request to this path")
+	if err := fs.Parse(args); err != nil {
+		return configCommandError(err)
+	}
+	if *configPath == "" {
+		return configCommandError(errors.New("--config is required"))
+	}
+	if fs.NArg() != 0 {
+		return configCommandError(fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " ")))
+	}
+	if err := requireDistinctPaths([]namedPath{{"--config", *configPath}, {"--out", *outPath}, {"--html", *htmlPath}, {"--raw-jsonl", *rawJSONLPath}}); err != nil {
+		return configCommandError(err)
+	}
+	if *htmlPath != "" && *rawJSONLPath != "" {
+		info, err := os.Stat(*rawJSONLPath)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return executionCommandError(fmt.Errorf("inspect request JSONL: %w", err))
+		}
+		if err == nil && info.Size() > 0 {
+			return configCommandError(errors.New("--raw-jsonl must be new or empty when --html is used so the report contains only this run"))
+		}
+	}
+
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		return configCommandError(err)
+	}
+	apiKey := ""
+	if cfg.Target.APIKeyEnv != "" {
+		apiKey = os.Getenv(cfg.Target.APIKeyEnv)
+		if apiKey == "" {
+			return configCommandError(fmt.Errorf("environment variable %s is empty", cfg.Target.APIKeyEnv))
+		}
+	}
+
+	var rawWriter *metrics.JSONLWriter
+	if *rawJSONLPath != "" {
+		rawWriter, err = metrics.OpenJSONL(*rawJSONLPath)
+		if err != nil {
+			return executionCommandError(err)
+		}
+	}
+
+	loadResult, runErr := loadgen.Run(ctx, loadgen.Config{
+		Load:    cfg.Load,
+		Safety:  cfg.Safety,
+		Pricing: cfg.Pricing,
+		Probe: probe.Config{
+			Endpoint:            strings.TrimRight(cfg.Target.BaseURL, "/") + "/chat/completions",
+			Model:               cfg.Target.Model,
+			Prompt:              cfg.Request.Prompt,
+			MaxCompletionTokens: cfg.Request.MaxCompletionTokens,
+			APIKey:              apiKey,
+			Timeout:             cfg.Request.Timeout.Duration,
+			StreamIdleTimeout:   cfg.Request.StreamIdleTimeout.Duration,
+		},
+	})
+	if runErr != nil && loadResult.StartedAt.IsZero() {
+		if rawWriter != nil {
+			_ = rawWriter.Close()
+		}
+		return configCommandError(runErr)
+	}
+
+	aggregator, err := metrics.NewAggregator(metrics.Pricing{
+		InputUSDPerMillionTokens:  cfg.Pricing.InputUSDPerMillionTokens,
+		OutputUSDPerMillionTokens: cfg.Pricing.OutputUSDPerMillionTokens,
+	})
+	if err != nil {
+		if rawWriter != nil {
+			_ = rawWriter.Close()
+		}
+		return executionCommandError(err)
+	}
+
+	var processingErr error
+	for _, outcome := range loadResult.Outcomes {
+		if outcome.Dropped {
+			if err := aggregator.RecordDropped(); err != nil {
+				processingErr = errors.Join(processingErr, err)
+			}
+			continue
+		}
+		requestErr := requestError(outcome)
+		if err := aggregator.Record(outcome.Result, requestErr); err != nil {
+			processingErr = errors.Join(processingErr, err)
+		}
+		if rawWriter != nil {
+			if err := rawWriter.WriteResult(outcome.Result, requestErr); err != nil {
+				processingErr = errors.Join(processingErr, err)
+			}
+		}
+	}
+	if rawWriter != nil {
+		if err := rawWriter.Close(); err != nil {
+			processingErr = errors.Join(processingErr, err)
+		}
+	}
+	summary := aggregator.Close()
+
+	sloResults, sloErr := evaluate(cfg.SLO, sloSummary(summary))
+	pending := evaluatorPending(cfg.SLO, sloResults, sloErr)
+	if sloErr == nil {
+		summary.SLOOutcomes = makeSLOOutcomes(cfg.SLO, sloSummary(summary), sloResults, pending)
+	}
+	if pending {
+		fmt.Fprintln(stderr, "slo: pending owner evaluator")
+	} else if sloErr == nil {
+		printSLOOutcomes(stderr, summary.SLOOutcomes)
+	}
+	if err := writeSummary(stdout, *outPath, summary); err != nil {
+		processingErr = errors.Join(processingErr, err)
+	}
+	if *htmlPath != "" {
+		metadata := report.Metadata{
+			Scenario:    "ramp",
+			ConfigFile:  filepath.Base(*configPath),
+			Target:      cfg.Target.BaseURL,
+			Model:       cfg.Target.Model,
+			StartedAt:   loadResult.StartedAt,
+			Duration:    loadResult.FinishedAt.Sub(loadResult.StartedAt),
+			ToolVersion: version,
+		}
+		if err := writeHTML(*htmlPath, summary, report.HTMLOptions{Metadata: metadata, RequestJSONLPath: *rawJSONLPath}); err != nil {
+			processingErr = errors.Join(processingErr, err)
+		}
+	}
+
+	if errors.Is(runErr, context.Canceled) || ctx.Err() != nil {
+		return context.Canceled
+	}
+	if runErr != nil {
+		return executionCommandError(runErr)
+	}
+	if processingErr != nil {
+		return executionCommandError(processingErr)
+	}
+	if sloErr != nil {
+		return executionCommandError(fmt.Errorf("evaluate SLOs: %w", sloErr))
+	}
+	if summary.Metrics.TTFT == nil || summary.Metrics.TTFT.Count == 0 {
+		return executionCommandError(errors.New("run produced no usable TTFT samples"))
+	}
+	if !pending {
+		for _, outcome := range summary.SLOOutcomes {
+			if outcome.Status == metrics.SLOStatusFail {
+				return &commandError{code: exitSLOFail, err: errors.New("one or more SLOs failed")}
+			}
+		}
+	}
+	return nil
+}
+
+func runReport(args []string, stderr io.Writer) error {
+	fs := flag.NewFlagSet("report", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	inputPath := fs.String("input", "", "path to an existing run summary JSON")
+	htmlPath := fs.String("html", "", "write a self-contained HTML report atomically to this path")
+	rawJSONLPath := fs.String("raw-jsonl", "", "include request records from this JSONL file")
+	if err := fs.Parse(args); err != nil {
+		return configCommandError(err)
+	}
+	if *inputPath == "" {
+		return configCommandError(errors.New("--input is required"))
+	}
+	if *htmlPath == "" {
+		return configCommandError(errors.New("--html is required"))
+	}
+	if fs.NArg() != 0 {
+		return configCommandError(fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " ")))
+	}
+	if err := requireDistinctPaths([]namedPath{{"--input", *inputPath}, {"--html", *htmlPath}, {"--raw-jsonl", *rawJSONLPath}}); err != nil {
+		return configCommandError(err)
+	}
+
+	summary, err := readSummary(*inputPath)
+	if err != nil {
+		return configCommandError(err)
+	}
+	options := report.HTMLOptions{
+		Metadata:         report.Metadata{ToolVersion: version},
+		RequestJSONLPath: *rawJSONLPath,
+	}
+	if err := writeHTML(*htmlPath, summary, options); err != nil {
+		return executionCommandError(err)
+	}
+	return nil
+}
+
+func readSummary(path string) (metrics.RunSummary, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return metrics.RunSummary{}, fmt.Errorf("open run summary: %w", err)
+	}
+	defer file.Close()
+
+	decoder := json.NewDecoder(file)
+	decoder.DisallowUnknownFields()
+	var summary metrics.RunSummary
+	if err := decoder.Decode(&summary); err != nil {
+		return metrics.RunSummary{}, fmt.Errorf("decode run summary: %w", err)
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return metrics.RunSummary{}, errors.New("decode run summary: multiple JSON values are not allowed")
+		}
+		return metrics.RunSummary{}, fmt.Errorf("decode run summary trailing data: %w", err)
+	}
+	if summary.SchemaVersion != metrics.SchemaVersion {
+		return metrics.RunSummary{}, fmt.Errorf("run summary schema_version %d is unsupported; expected %d", summary.SchemaVersion, metrics.SchemaVersion)
+	}
+	return summary, nil
+}
+
+type namedPath struct {
+	name string
+	path string
+}
+
+func requireDistinctPaths(paths []namedPath) error {
+	for left := 0; left < len(paths); left++ {
+		if paths[left].path == "" {
+			continue
+		}
+		leftPath, err := comparablePath(paths[left].path)
+		if err != nil {
+			return fmt.Errorf("resolve %s: %w", paths[left].name, err)
+		}
+		for right := left + 1; right < len(paths); right++ {
+			if paths[right].path == "" {
+				continue
+			}
+			rightPath, err := comparablePath(paths[right].path)
+			if err != nil {
+				return fmt.Errorf("resolve %s: %w", paths[right].name, err)
+			}
+			if leftPath == rightPath {
+				return fmt.Errorf("%s and %s must use different paths", paths[left].name, paths[right].name)
+			}
+		}
+	}
+	return nil
+}
+
+func comparablePath(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	if resolved, err := filepath.EvalSymlinks(absolute); err == nil {
+		return resolved, nil
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(absolute))
+	if err == nil {
+		return filepath.Join(parent, filepath.Base(absolute)), nil
+	}
+	return filepath.Clean(absolute), nil
+}
+
+func loadConfig(path string) (config.Config, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return config.Config{}, fmt.Errorf("open config: %w", err)
+	}
+	defer file.Close()
+	cfg, err := config.LoadReader(file)
+	if err != nil {
+		return config.Config{}, err
+	}
+	if err := cfg.Validate(); err != nil {
+		return config.Config{}, fmt.Errorf("validate config: %w", err)
+	}
+	return cfg, nil
+}
+
+func requestError(outcome loadgen.Outcome) error {
+	if outcome.Cancelled {
+		return context.Canceled
+	}
+	switch outcome.ErrorClass {
+	case loadgen.ErrorNone:
+		return nil
+	case loadgen.ErrorTimeout:
+		return context.DeadlineExceeded
+	case loadgen.ErrorHTTP:
+		return probe.ErrHTTPStatus
+	default:
+		if outcome.Error != "" {
+			return errors.New(outcome.Error)
+		}
+		return errors.New("stream request failed")
+	}
+}
+
+func sloSummary(summary metrics.RunSummary) slo.Summary {
+	result := slo.Summary{
+		ErrorRate:         summary.Counts.ErrorRate,
+		DroppedRate:       summary.Counts.DroppedRate,
+		ScheduledRequests: int(summary.Counts.Scheduled),
+		CostUSD:           summary.Usage.CostUSD,
+		UsageSamples:      int(summary.Usage.Samples),
+		CostComplete:      summary.Usage.Complete,
+	}
+	if summary.Metrics.TTFT != nil {
+		value := summary.Metrics.TTFT.P99
+		result.P99TTFTMS = &value
+		result.TTFTSamples = int(summary.Metrics.TTFT.Count)
+	}
+	if summary.Metrics.ChunkITL != nil {
+		value := summary.Metrics.ChunkITL.P99
+		result.P99ChunkITLMS = &value
+		result.ChunkITLSamples = int(summary.Metrics.ChunkITL.Count)
+	}
+	return result
+}
+
+func evaluatorPending(declared config.SLO, results []slo.Result, evaluateErr error) bool {
+	if evaluateErr != nil || len(results) == 0 || len(results) != configuredSLOCount(declared) {
+		return false
+	}
+	for _, result := range results {
+		if result.Metric != "" || result.Operator != "" {
+			return false
+		}
+	}
+	return true
+}
+
+func configuredSLOCount(declared config.SLO) int {
+	count := 0
+	for _, threshold := range []*float64{
+		declared.P99TTFTMS,
+		declared.P99ChunkITLMS,
+		declared.MaxErrorRate,
+		declared.MaxDroppedRate,
+		declared.MaxCostUSD,
+	} {
+		if threshold != nil {
+			count++
+		}
+	}
+	return count
+}
+
+func makeSLOOutcomes(declared config.SLO, observed slo.Summary, results []slo.Result, pending bool) []metrics.SLOOutcome {
+	if !pending {
+		outcomes := make([]metrics.SLOOutcome, len(results))
+		for i, result := range results {
+			pass := result.Pass
+			status := metrics.SLOStatusFail
+			if pass {
+				status = metrics.SLOStatusPass
+			}
+			outcomes[i] = metrics.SLOOutcome{
+				Metric:      result.Metric,
+				Observed:    result.Observed,
+				Operator:    result.Operator,
+				Threshold:   result.Threshold,
+				SampleCount: result.SampleCount,
+				Status:      status,
+				Pass:        &pass,
+			}
+		}
+		return outcomes
+	}
+
+	gates := []struct {
+		metric    string
+		threshold *float64
+		value     *float64
+		samples   int
+	}{
+		{metric: "p99_ttft_ms", threshold: declared.P99TTFTMS, value: observed.P99TTFTMS, samples: observed.TTFTSamples},
+		{metric: "p99_chunk_itl_ms", threshold: declared.P99ChunkITLMS, value: observed.P99ChunkITLMS, samples: observed.ChunkITLSamples},
+		{metric: "max_error_rate", threshold: declared.MaxErrorRate, value: &observed.ErrorRate, samples: observed.ScheduledRequests},
+		{metric: "max_dropped_rate", threshold: declared.MaxDroppedRate, value: &observed.DroppedRate, samples: observed.ScheduledRequests},
+		{metric: "max_cost_usd", threshold: declared.MaxCostUSD, value: observed.CostUSD, samples: observed.UsageSamples},
+	}
+	outcomes := make([]metrics.SLOOutcome, 0, len(results))
+	for _, gate := range gates {
+		if gate.threshold == nil {
+			continue
+		}
+		outcomes = append(outcomes, metrics.SLOOutcome{
+			Metric:      gate.metric,
+			Observed:    *gate.value,
+			Operator:    "<=",
+			Threshold:   *gate.threshold,
+			SampleCount: gate.samples,
+			Status:      metrics.SLOStatusPending,
+		})
+	}
+	return outcomes
+}
+
+func printSLOOutcomes(writer io.Writer, outcomes []metrics.SLOOutcome) {
+	if len(outcomes) == 0 {
+		fmt.Fprintln(writer, "slo: pass (no gates configured)")
+		return
+	}
+	for _, outcome := range outcomes {
+		fmt.Fprintf(writer, "slo: %s %s observed=%g threshold=%g samples=%d\n", outcome.Status, outcome.Metric, outcome.Observed, outcome.Threshold, outcome.SampleCount)
+	}
+}
+
+func writeSummary(stdout io.Writer, path string, summary metrics.RunSummary) error {
+	if path == "" {
+		return report.WriteJSON(stdout, summary)
+	}
+	return writeFileAtomically(path, "summary JSON", func(writer io.Writer) error {
+		return report.WriteJSON(writer, summary)
+	})
+}
+
+func writeHTML(path string, summary metrics.RunSummary, options report.HTMLOptions) error {
+	return writeFileAtomically(path, "HTML report", func(writer io.Writer) error {
+		return report.WriteHTML(writer, summary, options)
+	})
+}
+
+func writeFileAtomically(path, description string, write func(io.Writer) error) error {
+	directory := filepath.Dir(path)
+	temporary, err := os.CreateTemp(directory, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create %s temporary file: %w", description, err)
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0o644); err != nil {
+		temporary.Close()
+		return fmt.Errorf("set %s permissions: %w", description, err)
+	}
+	if err := write(temporary); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		temporary.Close()
+		return fmt.Errorf("sync %s temporary file: %w", description, err)
+	}
+	if err := temporary.Close(); err != nil {
+		return fmt.Errorf("close %s temporary file: %w", description, err)
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return fmt.Errorf("replace %s: %w", description, err)
+	}
+	return nil
+}
+
+func configCommandError(err error) error {
+	return &commandError{code: exitConfig, err: err}
+}
+
+func executionCommandError(err error) error {
+	return &commandError{code: exitExecution, err: err}
+}
+
+func exitCode(err error) int {
+	if errors.Is(err, context.Canceled) {
+		return exitInterrupt
+	}
+	var commandErr *commandError
+	if errors.As(err, &commandErr) {
+		return commandErr.code
+	}
+	return exitExecution
 }
 
 func milliseconds(d time.Duration) float64 {

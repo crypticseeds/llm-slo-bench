@@ -101,6 +101,39 @@ func TestAggregatorPercentilesStayWithinDeclaredPrecision(t *testing.T) {
 	}
 }
 
+func TestHistogramDistributionExportIsRealAndBounded(t *testing.T) {
+	empty := summarize(newHistogram(), 1000, histogramDurationUnit)
+	if empty != nil {
+		t.Fatalf("empty summary = %#v, want nil", empty)
+	}
+
+	single := newHistogram()
+	recordValues(single, 12_500)
+	singleDistribution := summarize(single, 1000, histogramDurationUnit).Distribution
+	singleValue := float64(single.ValueAtPercentile(100)) / 1000
+	if len(singleDistribution) != 2 || singleDistribution[0].Percentile != 0 || singleDistribution[1].Percentile != 100 ||
+		singleDistribution[0].Value != singleValue || singleDistribution[1].Value != singleValue {
+		t.Fatalf("single-sample distribution = %#v, want 0%% and 100%% at %.3fms", singleDistribution, singleValue)
+	}
+
+	histogram := newHistogram()
+	for value := int64(1); value <= 10_000; value++ {
+		recordValues(histogram, value)
+	}
+	distribution := summarize(histogram, 1000, histogramDurationUnit).Distribution
+	if len(distribution) > distributionPointCap {
+		t.Fatalf("distribution points = %d, exceeds cap %d", len(distribution), distributionPointCap)
+	}
+	if len(distribution) < 2 || distribution[len(distribution)-1].Value != float64(histogram.Max())/1000 {
+		t.Fatalf("distribution endpoint = %#v, want histogram max %.3f", distribution[len(distribution)-1], float64(histogram.Max())/1000)
+	}
+	for index := 1; index < len(distribution); index++ {
+		if distribution[index].Percentile < distribution[index-1].Percentile || distribution[index].Value < distribution[index-1].Value {
+			t.Fatalf("distribution is not monotonic at %d: %#v", index, distribution)
+		}
+	}
+}
+
 func TestAggregatorConcurrentRecordIsRaceFreeAndLossless(t *testing.T) {
 	aggregator := newTestAggregator(t)
 	const workers = 64
@@ -205,8 +238,15 @@ func TestAggregatorCloseReturnsFinalSummaryAndRejectsNewRecords(t *testing.T) {
 		t.Fatalf("final summary = %#v, want one success", final)
 	}
 	final.Metrics.TTFT.P99 = -1
+	pass := true
+	final.SLOOutcomes = []SLOOutcome{{Pass: &pass}}
+	closed := cloneSummary(final)
+	*closed.SLOOutcomes[0].Pass = false
 	if got := aggregator.Summary().Metrics.TTFT.P99; got < 0 {
 		t.Fatalf("closed Summary() shared mutable histogram pointer, P99 = %f", got)
+	}
+	if *final.SLOOutcomes[0].Pass != true {
+		t.Fatal("cloneSummary() shared mutable SLO pass pointer")
 	}
 	if err := aggregator.RecordDropped(); err == nil {
 		t.Fatal("RecordDropped() after Close error = nil")

@@ -30,19 +30,4 @@ jobs:
         run: go build ./...
 
       - name: Race tests
-        shell: bash
-        run: |
-          packages=(
-            ./cmd/...
-            ./internal/probe
-            ./internal/mockserver
-            ./internal/loadgen
-            ./internal/metrics
-          )
-          if [[ -d internal/report ]]; then
-            packages+=(./internal/report)
-          fi
-          go test -race "${packages[@]}"
-
-          # Enable once the owner-owned Config.Validate and ComparePercentile implementations land:
-          # go test -race ./...
+        run: go test -race ./...
