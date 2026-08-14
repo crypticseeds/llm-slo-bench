@@ -10,7 +10,7 @@ Status values: `todo`, `building`, `review`, `done`. Definitions of done are in 
 | D - Open-loop scheduler | agent | done | ADR v1 section 08, stream D; includes deferred mockserver `BaseContext` shutdown wiring and response-header timeout |
 | E - Metrics aggregation | agent | done | ADR v1 section 08, stream E |
 | F - CLI + reports | agent | done | ADR v1 section 08, stream F; ramp integration merged, Day 2 gate demonstrated on main; HTML report rendering merged: DevOpsFoundry design, uPlot charts, strict contract validation |
-| G - Release + CI | agent | todo | ADR v1 section 08, stream G |
+| G - Release + CI | agent | done | ADR v1 section 08, stream G |
 | H - Gateway evidence | agent | todo | ADR v1 section 08, stream H |
 
 ## Cut Notes
