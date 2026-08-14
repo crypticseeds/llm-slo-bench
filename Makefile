@@ -1,6 +1,6 @@
 BINARY := bin/llm-slo-bench
 VERSION ?= dev
-LDFLAGS := -s -w -X runtime.buildVersion=$(VERSION)
+LDFLAGS := -s -w -X main.version=$(VERSION)
 
 .PHONY: build test race demo demo-html
 
