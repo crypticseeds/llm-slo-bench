@@ -68,22 +68,24 @@ func TestRunAbsoluteDeadlinesDoNotDrift(t *testing.T) {
 }
 
 func TestRunUsesProbeDispatchForLagAndLateDrop(t *testing.T) {
-	var requests atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-		requests.Add(1)
-	}))
-	defer server.Close()
-	cfg := testConfig(realClock{})
+	clk := &fakeClock{now: time.Unix(100, 0)}
+	cfg := testConfig(clk)
 	cfg.Load.Stages = []config.Stage{{Duration: duration(20 * time.Millisecond), TargetRPS: 100}}
 	cfg.MaxScheduleLag = 10 * time.Millisecond
-	cfg.Probe.Endpoint = server.URL
-	cfg.runner = func(ctx context.Context, probeCfg probe.Config) (probe.Result, error) {
-		select {
-		case <-time.After(20 * time.Millisecond):
-		case <-ctx.Done():
-			return probe.Result{}, ctx.Err()
-		}
-		return probe.Run(ctx, probeCfg)
+	// The fake clock rules every stamp Run takes, so the worker reaches the
+	// runner exactly on its intended arrival and the scheduler's own lateness
+	// guard cannot fire. The runner then stands in for the client.Do boundary
+	// rejection, keeping the assertion free of real timer and goroutine
+	// jitter. TestProbeDispatchDeadlineRejectsOverdueRequestBeforeRoundTrip
+	// covers the real transport that produces that rejection.
+	//
+	// Run's completions channel orders the capture below before the read that
+	// follows Run.
+	var capturedTransport http.RoundTripper
+	cfg.runner = func(_ context.Context, probeCfg probe.Config) (probe.Result, error) {
+		capturedTransport = probeCfg.HTTPClient.Transport
+		clk.Advance(20 * time.Millisecond)
+		return probe.Result{Dispatch: clk.Now()}, errDispatchLate
 	}
 
 	result, err := Run(context.Background(), cfg)
@@ -94,6 +96,13 @@ func TestRunUsesProbeDispatchForLagAndLateDrop(t *testing.T) {
 		t.Fatalf("outcomes = %d, want 1", len(result.Outcomes))
 	}
 	outcome := result.Outcomes[0]
+	transport, ok := capturedTransport.(dispatchDeadlineTransport)
+	if !ok {
+		t.Fatalf("probe client transport = %T, want dispatchDeadlineTransport", capturedTransport)
+	}
+	if want := outcome.IntendedArrival.Add(cfg.MaxScheduleLag); !transport.deadline.Equal(want) {
+		t.Fatalf("probe dispatch deadline = %s, want intended arrival plus max schedule lag %s", transport.deadline, want)
+	}
 	if outcome.Dispatch != outcome.Result.Dispatch || outcome.ScheduleLag <= cfg.MaxScheduleLag {
 		t.Fatalf("outcome = %+v, want probe-boundary dispatch beyond lateness limit", outcome)
 	}
@@ -102,6 +111,25 @@ func TestRunUsesProbeDispatchForLagAndLateDrop(t *testing.T) {
 	}
 	if result.Counts.Started != 0 || result.Counts.Completed != 0 || result.Counts.Failed != 0 || result.SafetyBudgetUSD != 0 || outcome.ErrorClass != ErrorNone || outcome.Error != "" {
 		t.Fatalf("result = %+v, want pre-network drop with released reservation", result)
+	}
+}
+
+func TestProbeDispatchDeadlineRejectsOverdueRequestBeforeRoundTrip(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requests.Add(1)
+	}))
+	defer server.Close()
+	probeCfg := validProbeConfig()
+	probeCfg.Endpoint = server.URL
+	probeCfg.HTTPClient = clientWithDispatchDeadline(newHTTPClient(1, time.Second), time.Now().Add(-time.Second))
+
+	result, err := probe.Run(context.Background(), probeCfg)
+	if !errors.Is(err, errDispatchLate) {
+		t.Fatalf("probe.Run() error = %v, want %v", err, errDispatchLate)
+	}
+	if result.Dispatch.IsZero() {
+		t.Fatal("probe result dispatch is zero, want a client.Do boundary stamp for the lag calculation")
 	}
 	if requests.Load() != 0 {
 		t.Fatalf("server received %d requests, want overdue request rejected before RoundTrip", requests.Load())
