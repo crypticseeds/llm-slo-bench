@@ -3,10 +3,9 @@
 The probe uses one request. `http.Client` manages network I/O internally,
 and `time.AfterFunc` runs the idle-timeout callback in its own goroutine. That
 callback sends to a one-slot buffered `idleExpired` channel so it never blocks
-while the request goroutine is still inside a body read. Later load scenarios
-will run bounded request goroutines and send immutable results over a channel
-to one aggregator; that keeps histogram mutation off the timing path and avoids
-shared locks.
+while the request goroutine is still inside a body read. The ramp scenario runs
+bounded request goroutines and returns immutable results to one aggregator;
+that keeps histogram mutation off the timing path and avoids shared locks.
 
 ## Clock Points
 

@@ -2,6 +2,7 @@
 /bin/
 /dist/
 /artifacts/
+/reports/
 *.out
 coverage.*
 .env*
