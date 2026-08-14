@@ -1,0 +1,10 @@
+.git
+.github
+artifacts
+bin
+dist
+docs
+*.out
+coverage.*
+.DS_Store
+.env*
