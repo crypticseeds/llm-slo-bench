@@ -4,13 +4,13 @@ Status values: `todo`, `building`, `review`, `done`. Definitions of done are in 
 
 | Stream | Owner | Status | DoD reference |
 | --- | --- | --- | --- |
-| A - Config loader + SLO evaluator | Femi | building | ADR v1 section 08, stream A; unblocked: parser/types/tests and corrected contract ready, `Config.Validate` and `ComparePercentile` remain |
+| A - Config loader + SLO evaluator | Femi | done | ADR v1 section 08, stream A; unblocked: parser/types/tests and corrected contract ready, `Config.Validate` and `ComparePercentile` remain |
 | B - Built-in mock SSE server | agent | done | ADR v1 section 08, stream B |
 | C - SSE client + semantic timing | agent | done | ADR v1 section 08, stream C; record TTFB and semantic TTFT, gate only TTFT; compression disabled |
 | D - Open-loop scheduler | agent | done | ADR v1 section 08, stream D; includes deferred mockserver `BaseContext` shutdown wiring and response-header timeout |
 | E - Metrics aggregation | agent | done | ADR v1 section 08, stream E |
 | F - CLI + reports | agent | done | ADR v1 section 08, stream F; ramp integration merged, Day 2 gate demonstrated on main; HTML report rendering merged: DevOpsFoundry design, uPlot charts, strict contract validation |
-| G - Release + CI | agent | todo | ADR v1 section 08, stream G |
+| G - Release + CI | agent | done | ADR v1 section 08, stream G |
 | H - Gateway evidence | agent | todo | ADR v1 section 08, stream H |
 
 ## Cut Notes

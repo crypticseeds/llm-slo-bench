@@ -1,0 +1,37 @@
+version: 2
+
+project_name: llm-slo-bench
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - id: llm-slo-bench
+    main: ./cmd/llm-slo-bench
+    binary: llm-slo-bench
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - formats: [tar.gz]
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
