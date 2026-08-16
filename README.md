@@ -206,7 +206,7 @@ Point `target.base_url` at a real endpoint and set `api_key_env` to gate a live 
 | --- | --- | --- |
 | p99 TTFT | 135.9 ms | ramp 5-10 req/s, streaming through gateway |
 | Sustained throughput | 10 req/s | zero drops, zero errors (175/175); 20 req/s attempt was admission-bound by `max_in_flight: 4` in the run config, not by the gateway |
-| Failover behaviour | 0 client-visible errors (180/180) | provider killed mid-run; circuit breaker re-closed 13.7 s after the kill (~3.7 s after provider restore); no request failed during the outage |
+| Failover behaviour | 0 client-visible errors (180/180) | provider killed mid-run; circuit breaker re-closed 13.7 s after the kill (1.8 s after provider restore); no request failed during the outage |
 
 ## Limitations
 
