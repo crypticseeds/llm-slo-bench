@@ -6,3 +6,8 @@
 *.out
 coverage.*
 .env*
+
+# root-level scratch run artifacts (personal test outputs)
+/*.html
+/*.json
+/*.jsonl
