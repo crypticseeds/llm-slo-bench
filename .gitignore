@@ -11,3 +11,7 @@ coverage.*
 /*.html
 /*.json
 /*.jsonl
+
+# internal orchestration files (kept locally, untracked)
+/BOARD.md
+/AGENTS.md
