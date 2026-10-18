@@ -193,20 +193,21 @@ Point `target.base_url` at a real endpoint and set `api_key_env` to gate a live 
 
 ## Measured results
 
-<!--
-  COORDINATOR: fill from the joint gateway run. Replace each {{TOKEN}} with the
-  measured value and delete this comment. Do not populate from a local mock run.
--->
+One live `ramp` run directly against a vLLM OpenAI-compatible endpoint, with no gateway in between. All numbers are client-side, measured from the load generator (see Limitations).
 
-> **TBD - not yet measured.** The placeholders below are filled from a joint run against
-> [`sre-inference-gateway`](https://github.com/crypticseeds/sre-inference-gateway) and are unpopulated
-> until that run completes. No number in this section is estimated, extrapolated, or taken from a mock.
+**Setup:** vLLM 0.21.0 serving `Qwen/Qwen3-8B` (BF16, `--enforce-eager`, `--max-num-seqs 16`) on one NVIDIA A10 (Modal, `max_containers=1`). Load generated from a Raspberry Pi (arm64) over the public internet to Modal us-east, llm-slo-bench `d94f17f`. 20-token prompt ending in `/no_think` so semantic TTFT is not inflated by reasoning tokens. `max_completion_tokens: 128`, `max_in_flight: 8`, three 2-minute stages ramping linearly 0 -> 0.5 -> 1 -> 2 req/s. Run date 2026-10-18. Config: [`slo-bench-modal.yaml`](https://github.com/crypticseeds/inference-engineering/blob/main/observability/slo-bench-modal.yaml).
 
-| Metric | Value | Source |
+| Metric | Value | Notes |
 | --- | --- | --- |
-| p99 TTFT | 135.9 ms | ramp 5-10 req/s, streaming through gateway |
-| Sustained throughput | 10 req/s | zero drops, zero errors (175/175); 20 req/s attempt was admission-bound by `max_in_flight: 4` in the run config, not by the gateway |
-| Failover behaviour | 0 client-visible errors (180/180) | provider killed mid-run; circuit breaker re-closed 13.7 s after the kill (1.8 s after provider restore); no request failed during the outage |
+| p50 / p99 semantic TTFT | 194.0 ms / 247.8 ms | 300 samples; includes network and TLS to Modal. vLLM's server-side mean TTFT for the same run was 94.5 ms |
+| p50 / p99 chunk ITL | 36.8 ms / 49.1 ms | 21,064 samples; per SSE content event, not per token |
+| p50 / p99 TTFB | 98.9 ms / 155.1 ms | transport diagnostic, not gated |
+| Offered load | 0-2 req/s linear ramp | the configured test load, **not** a measured capacity limit; the server peaked at 5 running requests and 0 waiting |
+| Outcomes | 300/300 ok, 0 errors, 0 dropped | |
+| Avg generation throughput | 27.7 tokens/s per request | completion tokens / (duration - TTFT); 72 completion tokens per request on average |
+| SLO verdict | pass (exit 0) | gates: `p99_ttft_ms <= 2000`, `max_error_rate <= 0.01` |
+
+Not measured in this run: capacity at saturation, and gateway failover behaviour. Those need a dedicated run and are not inferred from this one.
 
 ## Limitations
 
